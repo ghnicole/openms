@@ -14,8 +14,7 @@ export function inputTargetTick(timing, now) {
   const arrival = Math.floor(
     (now + timing.oneWayMs + timing.tickOffsetMs) / PROTOCOL.TICK_MS,
   );
-  return Math.min(
-    Math.max(timing.serverTick, arrival) + PROTOCOL.INPUT_BUFFER_TICKS,
-    timing.serverTick + inputHorizonTicks(timing),
-  );
+  // History capacity and observation age bound speculation in OnlinePrediction.
+  // A delayed server packet must not stop the local simulation clock.
+  return Math.max(timing.serverTick, arrival) + PROTOCOL.INPUT_BUFFER_TICKS;
 }

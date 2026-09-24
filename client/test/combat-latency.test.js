@@ -341,7 +341,7 @@ test("an admitted basic attack resolves its own hit on the local release frame",
   });
   expect(record.hitScheduled).toBe(true);
   clearTimeout(record.hitTimer);
-  f.local.hits.resolve(record);
+  f.local.hits.presentResolved(record);
   expect(shown.length).toBe(1);
   expect(shown[0].amount).toBeGreaterThan(0);
   expect(f.local.hits.reaction(view)).toBe("hit1");
@@ -395,4 +395,20 @@ test("the thrower adopts the authoritative projectile plan and converges onto it
   const expected = plan.startX + (plan.endX - plan.startX) * (flight.age / 500);
   expect(flight.animation.container.position.x).toBeCloseTo(expected, 0);
   f.local.destroy();
+});
+
+test("rapid basic attack edges wait for their local action and disappear on field replacement", async () => {
+  const f = await fixture();
+  f.local.input({ attack: true }, 1);
+  f.local.input({ attack: false }, 2);
+  f.local.input({ attack: true }, 3);
+  expect(f.local.records.size).toBe(1);
+  expect(f.local.queued).toHaveLength(1);
+  f.time(1000);
+  f.local.update();
+  expect(f.local.current().identity).toBe(3);
+  f.local.input({ attack: false }, 4);
+  f.local.input({ attack: true }, 5);
+  f.local.destroy();
+  expect(f.local.queued).toHaveLength(0);
 });

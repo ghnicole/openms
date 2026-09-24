@@ -52,7 +52,7 @@ function skillSpec(owner, combat, derived, skillId) {
   const skill = owner.catalog.ui.skills[skillId];
   const rank = owner.store.profile.skills[skillId]?.level ?? 0;
   const info = skill?.levels[rank];
-  if (!info || owner.store.profile.mp < Number(info.mpCon ?? 0)) return null;
+  if (!info) return null;
   const spec = COMBAT_SKILLS.get(skillId);
   const action = spec
     ? skillAttackAction(skill, info, spec, combat)

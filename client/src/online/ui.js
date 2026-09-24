@@ -80,6 +80,8 @@ export class OnlineUI {
     this.connection = null;
     this.catalog = null;
     this.pending = 0;
+    this.blockingPending = 0;
+    this.nextCast = null;
     this.operationIdle = null;
     this.destroyed = false;
     this.store = new NativeProfileSource(this);
@@ -150,7 +152,7 @@ export class OnlineUI {
       onStatus: (text) => this.hooks.onStatus?.(text),
       onAction: (name) => this.activateBinding(name),
       onCloseWindow: (name) => this.windowClosed(name),
-      isOperationPending: () => !this.destroyed && this.pending > 0,
+      isOperationPending: () => !this.destroyed && this.blockingPending > 0,
       isFieldBlocked: () => this.blocked(),
       windowCapability: (name) => this.windowCapability(name),
       isWorldInteractive: (x, y) =>
@@ -345,6 +347,8 @@ export class OnlineUI {
     }
   }
   releaseCharacter() {
+    this.nextCast = null;
+    this.store.optimistic.clear();
     clearTimeout(this.chatTimer);
     this.chatDraft = null;
     if (this.dialogue.event) {
@@ -412,38 +416,53 @@ export class OnlineUI {
       this.closeStorage();
     }
   }
-  command(action, revision) {
+  command(action, revision, preview = null) {
     if (this.destroyed) {
       return Promise.reject(new Error("Native online UI was destroyed."));
     }
-    this.beginOperation();
+    const blocking = !preview && action.kind !== "skill.cast";
+    this.beginOperation(blocking);
     let pending;
     try {
       pending = this.transport.command(action, revision);
     } catch (error) {
-      this.finishOperation();
+      this.finishOperation(blocking);
       return Promise.reject(error);
     }
-    const result = this.completeCommand(pending);
+    this.store.optimistic.add(pending.operationId, preview);
+    this.store.publish();
+    const result = this.completeCommand(pending, blocking);
     result.operationId = pending.operationId;
     return result;
   }
-  async completeCommand(pending) {
+  async completeCommand(pending, blocking) {
     try {
-      const receipt = await pending;
+      let receipt = await pending;
+      if (receipt.status === "unknown") {
+        this.ui.status("Awaiting server confirmation…");
+        receipt = await this.transport.recover(receipt.operationId);
+      }
+      this.store.optimistic.settle(pending.operationId, receipt);
+      this.store.publish();
       if (receipt.status !== "committed") {
         this.ui.status(nativeOutcome(receipt).reason);
       }
       return receipt;
+    } catch (error) {
+      this.store.optimistic.settle(pending.operationId, { status: "rejected" });
+      this.store.publish();
+      throw error;
     } finally {
-      this.finishOperation();
+      this.finishOperation(blocking);
     }
   }
-  beginOperation() {
+  beginOperation(blocking = true) {
+    if (blocking) this.blockingPending++;
     if (!this.pending) this.operationIdle = Promise.withResolvers();
     this.pending++;
   }
-  finishOperation() {
+  finishOperation(blocking = true) {
+    if (blocking) this.blockingPending--;
     this.pending--;
     if (this.pending) return;
     this.operationIdle?.resolve();
@@ -455,7 +474,8 @@ export class OnlineUI {
     return this.operationIdle?.promise ?? Promise.resolve();
   }
   async request(action, revision) {
-    return nativeOutcome(await this.command(action, revision));
+    const preview = this.store.optimistic.plan(action);
+    return nativeOutcome(await this.command(action, revision, preview));
   }
   async persist(action) {
     const result = await this.request(action);
@@ -540,7 +560,34 @@ export class OnlineUI {
       : "No available SP or active server field.";
   }
   cast(skillId) {
-    if (this.blocked() || this.localCombat?.current()) return false;
+    if (this.blocked()) return false;
+    const current = this.localCombat?.current();
+    if (current) {
+      if (
+        this.catalog.ui.skills[skillId]?.classification.activation === "channel"
+      ) {
+        return false;
+      }
+      const now = performance.now();
+      if (current.duration - (now - current.started) > 200) return false;
+      this.nextCast = {
+        skillId,
+        expires: now + 200,
+        epoch: this.state.fieldEpoch,
+      };
+      return true;
+    }
+    let preview;
+    try {
+      preview = this.store.optimistic.plan({ kind: "skill.cast", skillId });
+      if (!preview) return false;
+    } catch (error) {
+      this.ui.status(error.message);
+      return false;
+    }
+    return this.startCast(skillId, preview);
+  }
+  startCast(skillId, preview) {
     // Movement skills are predicted locally so the arc starts on the key press. The
     // authoritative divert for the same skill is then not merged twice, and a refused
     // cast restores the exact pre-cast kernel checkpoint so no unadmitted impulse
@@ -552,10 +599,13 @@ export class OnlineUI {
     const response = this.command({ kind: "skill.cast", skillId });
     const pose = this.localCombat?.begin(skillId, response.operationId);
     const feedback = this.skillVisuals?.predict(skillId, response.operationId);
+    // Select the current cast's projectile before reserving its last ammunition.
+    this.store.optimistic.add(response.operationId, preview);
+    this.store.publish();
     response
       .then((receipt) => {
-        if (feedback) feedback.confirmed = true;
-        if (receipt.status !== "committed") {
+        if (feedback) feedback.confirmed = receipt.status === "committed";
+        if (receipt.status === "rejected") {
           this.localCombat?.reject(pose);
           this.rollbackOptimistic(token);
           this.skillVisuals?.local.reject(feedback);
@@ -1077,6 +1127,10 @@ export class OnlineUI {
       }
     }
   }
+  /** Report provisional local digits for diagnostics; server rolls determine outcomes. */
+  reportHits(report) {
+    return this.transport.reportHits(report);
+  }
   impactAudio(event) {
     const predicted = this.localCombat.consumeImpact(event);
     const target = this.entities.find((entry) => entry.id === event.targetId);
@@ -1148,7 +1202,23 @@ export class OnlineUI {
     this.ui.resize(width, height);
     this.questReady.resize();
   }
+  flushNextCast() {
+    const next = this.nextCast;
+    if (!next) return;
+    if (
+      this.blocked() ||
+      next.epoch !== this.state.fieldEpoch ||
+      performance.now() > next.expires
+    ) {
+      this.nextCast = null;
+    } else if (!this.localCombat.current()) {
+      this.nextCast = null;
+      this.cast(next.skillId);
+    }
+  }
   draw(elapsedMs) {
+    this.flushNextCast();
+    this.localCombat.update();
     this.effects.update();
     this.macros?.update(elapsedMs);
     this.skillVisuals.update(elapsedMs);

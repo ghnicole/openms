@@ -35,7 +35,9 @@ function transition(phase, fieldEpoch, eventSeq) {
 
 function connected() {
   const sent = [];
-  const transport = new OnlineTransport();
+  const transport = new OnlineTransport({
+    onCommand: (fields) => expect(Object.isFrozen(fields)).toBe(true),
+  });
   const socket = {
     readyState: WebSocket.OPEN,
     bufferedAmount: 0,
@@ -185,19 +187,17 @@ for (const [phase, destination] of [
   });
 }
 
-test("neutral events are deduplicated within the bounded latency-adjusted input horizon", () => {
+test("neutral events are deduplicated while local time continues through delayed observations", () => {
   const { transport, sent } = connected();
   try {
     // Synthetic receive time zero keeps the inflated estimate ahead regardless of
     // test-runner scheduling; no sleeps or process-global clock replacement.
     transport.timing(timing("source", 13), performance.now() - 1000, 300);
     for (let event = 0; event < 16; event++) transport.neutral();
-    // The inflated wall-clock estimate cannot grant lead past the authenticated tick.
-    const leadTick = 13 + inputHorizonTicks(transport.clock);
+    const leadTick = sent[0].targetTick;
+    expect(leadTick).toBeGreaterThan(13 + inputHorizonTicks(transport.clock));
     expect(sent.map((message) => message.targetTick)).toEqual([leadTick]);
     expect(transport.sendInput(input(leadTick))).toBeNull();
-    expect(transport.sendInput(input(leadTick + 1))).toBeNull();
-    transport.timing(timing("source", 14), performance.now());
     expect(transport.sendInput(input(leadTick + 1))).toBe(2);
     expect(sent[1]).toMatchObject({
       type: "input",
@@ -363,6 +363,183 @@ test("creation roll responses require a real id and valid integer totals", async
     expect(Object.isFrozen(roll)).toBe(true);
   } finally {
     globalThis.fetch = originalFetch;
+    transport.close();
+  }
+});
+
+test("same-domain intentions bind successive confirmed revisions while their IDs remain stable", async () => {
+  const { transport, sent } = connected();
+  transport.limits.commandPerSecond = 12;
+  try {
+    const first = transport.command({
+      kind: "inventory.move",
+      itemId: "item",
+      quantity: 1,
+      to: { tab: "use", slot: 2 },
+    });
+    const second = transport.command({
+      kind: "inventory.move",
+      itemId: "item",
+      quantity: 1,
+      to: { tab: "use", slot: 3 },
+    });
+    expect(sent).toHaveLength(1);
+    transport.nextCommandAt = 0;
+    transport.result({
+      operationId: first.operationId,
+      status: "committed",
+      domainRevision: 7,
+    });
+    expect(sent).toHaveLength(2);
+    expect(sent[1].operationId).toBe(second.operationId);
+    expect(sent[1].expectedRevision).toBe(7);
+    const pending = transport.pending.get(second.operationId);
+    pending.unknown = true;
+    transport.nextCommandAt = 0;
+    transport.revisions.inventory = 99;
+    const recovered = transport.recover(second.operationId);
+    expect(sent[2].expectedRevision).toBe(7);
+    expect(sent[2].operationId).toBe(second.operationId);
+    transport.result({
+      operationId: second.operationId,
+      status: "committed",
+      domainRevision: 8,
+    });
+    expect((await recovered).domainRevision).toBe(8);
+    await Promise.all([first, second]);
+    expect((await transport.recover(second.operationId)).domainRevision).toBe(
+      8,
+    );
+  } finally {
+    transport.close();
+  }
+});
+
+test("refused parents cancel dependent intentions without sending them", async () => {
+  const { transport, sent } = connected();
+  try {
+    const action = {
+      kind: "inventory.move",
+      itemId: "item",
+      quantity: 1,
+      to: { tab: "use", slot: 2 },
+    };
+    const first = transport.command(action);
+    const second = transport.command({
+      ...action,
+      to: { tab: "use", slot: 3 },
+    });
+    transport.nextCommandAt = 0;
+    transport.result({
+      operationId: first.operationId,
+      status: "rejected",
+      code: "NOT_ALLOWED",
+      domainRevision: 0,
+    });
+    expect((await second).status).toBe("rejected");
+    expect(sent).toHaveLength(1);
+    await first;
+  } finally {
+    transport.close();
+  }
+});
+
+test("unstarted casts expire, while release bypasses a blocked character queue", async () => {
+  const { transport, sent } = connected();
+  transport.limits.commandPerSecond = 12;
+  try {
+    const first = transport.command({ kind: "skill.cast", skillId: 1001004 });
+    const second = transport.command({ kind: "skill.cast", skillId: 1001004 });
+    const pending = transport.pending.get(second.operationId);
+    pending.queuedAt = performance.now() - 2001;
+    const release = transport.command({
+      kind: "skill.release",
+      skillId: 2001004,
+    });
+    expect(sent.map((entry) => entry.action.kind)).toEqual([
+      "skill.cast",
+      "skill.release",
+    ]);
+    transport.nextCommandAt = 0;
+    transport.recoverPending();
+    expect((await second).code).toBe("COOLDOWN");
+    transport.result({
+      operationId: release.operationId,
+      status: "committed",
+      domainRevision: 0,
+    });
+    transport.result({
+      operationId: first.operationId,
+      status: "committed",
+      domainRevision: 1,
+    });
+    await Promise.all([first, release]);
+  } finally {
+    transport.close();
+  }
+});
+
+test("backpressure retains each input edge and a field transition discards the old journal", () => {
+  const { transport, sent } = connected();
+  try {
+    transport.socket.bufferedAmount = 200000;
+    transport.timing(timing("source", 13), performance.now(), 0);
+    expect(transport.sendInput({ ...input(14), attack: true })).toBe(1);
+    expect(transport.sendInput({ ...input(15), attack: false })).toBe(2);
+    expect(sent).toHaveLength(0);
+    transport.socket.bufferedAmount = 0;
+    transport.flushInputs();
+    expect(sent.map((entry) => [entry.inputSeq, entry.attack])).toEqual([
+      [1, true],
+      [2, false],
+    ]);
+    transport.socket.bufferedAmount = 200000;
+    transport.sendInput(input(16));
+    transport.transition(transition("prepare", "destination", 2));
+    expect(transport.inputJournal.count).toBe(0);
+  } finally {
+    transport.close();
+  }
+});
+
+test("release preserves its cast's send order while bypassing unrelated character work", async () => {
+  const { transport, sent } = connected();
+  transport.limits.commandPerSecond = 12;
+  try {
+    const first = transport.command({
+      kind: "skills.allocate",
+      skillId: 1001004,
+      amount: 1,
+    });
+    const cast = transport.command({ kind: "skill.cast", skillId: 2121001 });
+    const release = transport.command({
+      kind: "skill.release",
+      skillId: 2121001,
+    });
+    expect(sent).toHaveLength(1);
+    transport.nextCommandAt = 0;
+    transport.result({
+      operationId: first.operationId,
+      status: "committed",
+      domainRevision: 1,
+    });
+    expect(sent.map((entry) => entry.action.kind)).toEqual([
+      "skills.allocate",
+      "skill.cast",
+      "skill.release",
+    ]);
+    transport.result({
+      operationId: release.operationId,
+      status: "committed",
+      domainRevision: 1,
+    });
+    transport.result({
+      operationId: cast.operationId,
+      status: "committed",
+      domainRevision: 2,
+    });
+    await Promise.all([first, cast, release]);
+  } finally {
     transport.close();
   }
 });

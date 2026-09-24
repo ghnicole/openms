@@ -52,6 +52,7 @@ function historyEntry() {
     vertical: 0,
     jump: false,
     attack: false,
+    movementLocked: false,
     x: 0,
     y: 0,
     vx: 0,
@@ -59,16 +60,8 @@ function historyEntry() {
   };
 }
 
-/** Disposable movement presentation. Call advance from a fixed scheduler, never from RAF.
- *
- *  The browser is the source of truth for the character's own XY: an ordinary checkpoint
- *  is an observation that updates timing, acknowledgement and server-owned controls but
- *  never repositions the prediction. Only a checkpoint the authority marks
- *  `authoritative` (field transition, death, seat, unpredicted movement skill)
- *  replaces the local kernel state. External impulses — a mob knockback or a movement
- *  skill the client did not already predict — merge into the client's *current* state
- *  through the same kernel entry point the authority used, so the resulting trajectory
- *  is the original one the player expects. */
+/** Disposable input prediction. Every server checkpoint restores trusted simulation;
+ * the unconfirmed input suffix is replayed without sending or presenting new effects. */
 export class OnlinePrediction {
   constructor({ onInput, onResync, onGroundJump, onMovementLock } = {}) {
     this.onInput = onInput;
@@ -145,8 +138,7 @@ export class OnlinePrediction {
     }
   }
 
-  /** Consume one authoritative checkpoint. Ordinary checkpoints are observations; only
-   *  an `authoritative` one (or the first authenticated one) replaces local state. */
+  /** Rebase on every checkpoint. `authoritative` additionally marks a forced relocation. */
   observe(message) {
     if (!this.simulation) return;
     if (!this.acceptObserved(message)) return;
@@ -164,18 +156,17 @@ export class OnlinePrediction {
     this.controlFrame = message;
     this.observeJump(message.motion.groundJumpSequence);
     if (message.authoritative) this.hitPreview?.clear();
-    // Impulses merge into the client's own trajectory; they never reload it.
+    // Consume visual confirmations first; the checkpoint already contains these forces.
     this.applyDiverts(message.diverts);
-    if (!wasReady || message.authoritative) {
-      this.adoptCheckpoint(message, message.motion);
-      // Initial synchronization adopts outright; only an already-presented pose glides.
-      if (wasReady) {
-        this.corrections++;
-        this.reconcilePresentation(visibleX, visibleY, true);
-      }
-    } else {
-      this.adoptControls(message.motion);
-      this.retireHistoryTo(message.serverTick);
+    if (message.authoritative) this.pendingImpulses.length = 0;
+    this.adoptCheckpoint(message, message.motion);
+    if (
+      wasReady &&
+      Math.hypot(visibleX - this.simulation.x, visibleY - this.simulation.y) >
+        0.001
+    ) {
+      this.corrections++;
+      this.reconcilePresentation(visibleX, visibleY, message.authoritative);
     }
   }
 
@@ -207,28 +198,12 @@ export class OnlinePrediction {
     this.held.attackPressed = false;
     this.retireHistory();
     this.predictedTick = message.serverTick;
+    this.replayImpulses(message.serverTick, true);
     if (this.paused) {
       this.head = 0;
       this.count = 0;
       this.catchUpDebt = 0;
     } else this.replay();
-  }
-
-  /** Adopt the non-positional state the server owns while the client keeps its own XY.
-   *  Movement coefficients carry buffs, shoes and forms; the lock and seat are
-   *  authoritative transitions rather than free-form position. */
-  adoptControls(motion) {
-    const sim = this.simulation;
-    Object.assign(sim.effectiveSettings, motion.effectiveSettings);
-    const world = sim.worldMovement;
-    world.wingsX = motion.worldMovement.wingsX;
-    world.equipmentFs = motion.worldMovement.equipmentFs;
-    world.equipmentSwim = motion.worldMovement.equipmentSwim;
-    world.form = motion.worldMovement.form
-      ? { ...motion.worldMovement.form }
-      : null;
-    sim.movementLocked = motion.movementLocked;
-    sim.seat = motion.seat === null ? null : { ...motion.seat };
   }
 
   /** Merge every announced impulse into the client's own current kernel state. A skill
@@ -273,6 +248,7 @@ export class OnlinePrediction {
       motion: captureMotion(this.simulation),
       flashUsed: this.flashUsed,
       impulseUntilTick: this.impulseUntilTick,
+      tick: this.predictedTick,
     };
     this.mergeImpulse(action.vx, action.vy);
     this.pendingImpulses.push(token);
@@ -302,7 +278,12 @@ export class OnlinePrediction {
     // An accepted echo or a field replacement retires the token permanently.
     if (index < 0) return;
     this.pendingImpulses.splice(index, 1);
-    restoreMotion(this.simulation, token.motion);
+    const visibleX = this.simulation.x;
+    const visibleY = this.simulation.y;
+    if (this.controlFrame) {
+      this.adoptCheckpoint(this.controlFrame, this.controlFrame.motion);
+    } else restoreMotion(this.simulation, token.motion);
+    this.reconcilePresentation(visibleX, visibleY);
     if (this.hitPreview?.sourceId) {
       this.hitPreview.reject(this.hitPreview.sourceId);
     }
@@ -318,6 +299,15 @@ export class OnlinePrediction {
       }
     }
     return false;
+  }
+
+  /** Reapply only unconfirmed local impulses at their original position in the suffix. */
+  replayImpulses(tick, baseline = false) {
+    for (const token of this.pendingImpulses) {
+      if (baseline ? token.tick <= tick : token.tick === tick) {
+        applyExternalImpulse(this.simulation, token.vx, token.vy);
+      }
+    }
   }
 
   /** Absorb a server-owned reposition in presentation space: the drawn pose stays where
@@ -395,10 +385,7 @@ export class OnlinePrediction {
     if (delta > 0 && delta < 0x80000000) this.onGroundJump?.();
   }
 
-  /** Adopt a server-owned relocation — a same-map portal or teleport — into the local
-   *  kernel. The browser owns its own XY for ordinary movement, but a transition is a
-   *  server-authored reposition: it must reach the prediction, not just the drawn pose, or
-   *  the next predicted frame pulls the player back to the pre-portal position. */
+  /** A forced relocation replaces the kernel and retires pre-transition prediction. */
   relocate(x, y) {
     const sim = this.simulation;
     if (!sim || !Number.isFinite(x) || !Number.isFinite(y)) return;
@@ -436,7 +423,13 @@ export class OnlinePrediction {
         this.requestResync();
         return;
       }
-      this.prepareEntryReplay(entry);
+      if (index > 0) this.replayImpulses(entry.targetTick - 1);
+      if (this.onMovementLock && this.controlFrame) {
+        this.simulation.movementLocked = this.onMovementLock(
+          this.controlFrame,
+          entry.movementLocked,
+        );
+      }
       assignHeldInput(this.held, entry);
       stepMotion(this.simulation, this.held);
       this.recordPose(entry);
@@ -444,15 +437,6 @@ export class OnlinePrediction {
       this.predictedTick = entry.targetTick;
       this.replayedTicks++;
     }
-  }
-
-  /** An acknowledged input is already reflected in the authoritative checkpoint, so the
-   *  newest held state replaces it. */
-  prepareEntryReplay(entry) {
-    if (entry.inputSeq > 0 && entry.inputSeq <= this.ackInputSeq) {
-      entry.inputSeq = 0;
-    }
-    if (entry.inputSeq === 0) this.copyHeld(entry);
   }
 
   captureProbe(probe, entry) {
@@ -559,9 +543,8 @@ export class OnlinePrediction {
     // it with its own simulation for the same tick before stepping. -0 is not a legal
     // wire scalar, so it is normalized here rather than rejected at encode time.
     this.copyMotion(sample.motion);
-    const inputSeq = transmit ? this.onInput?.(sample) : 0;
-    if (inputSeq === null || inputSeq === undefined) return false;
-    if (!Number.isSafeInteger(inputSeq) || inputSeq < (transmit ? 1 : 0)) {
+    const inputSeq = (transmit ? this.onInput?.(sample) : 0) ?? 0;
+    if (!Number.isSafeInteger(inputSeq) || inputSeq < 0) {
       throw new Error("Input sender must return admitted sequence");
     }
     this.applyLocalControls(transmit);
@@ -572,6 +555,7 @@ export class OnlinePrediction {
     entry.vertical = sample.vertical;
     entry.jump = sample.jump;
     entry.attack = sample.attack;
+    entry.movementLocked = this.simulation.movementLocked;
     assignHeldInput(this.held, sample);
     stepMotion(this.simulation, this.held);
     this.hitPreview?.step(this.held);
@@ -601,9 +585,7 @@ export class OnlinePrediction {
     this.copyInput(target, this.held);
   }
 
-  /** Locally predicted motion for a resume handshake. The client is the source of truth
-   *  for its own position, so a reconnect offers where it actually is instead of being
-   *  snapped back to the last state the server happened to checkpoint. */
+  /** Diagnostic resume hint; the next server checkpoint restores trusted motion. */
   resumeMotion() {
     if (!this.simulation) return null;
     const motion = { x: 0, y: 0, vx: 0, vy: 0 };
@@ -611,7 +593,7 @@ export class OnlinePrediction {
     return motion;
   }
 
-  /** Bounded local prediction for the server's adoption check; never a rule input. */
+  /** Bounded local prediction for diagnostics; never a server rule input. */
   copyMotion(target) {
     const sim = this.simulation;
     target.x = normalizeZero(sim.x);

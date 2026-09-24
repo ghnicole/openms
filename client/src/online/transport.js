@@ -12,7 +12,8 @@ import { ServerClock } from "./transport-clock.js";
 import { validStartingStats } from "../../../shared/starting-stats.js";
 import { resource } from "../rendering/stream-validation.js";
 import { sameWorldIdentity } from "../../../shared/world-content.js";
-import { inputHorizonTicks, inputTargetTick } from "./input-timing.js";
+import { inputTargetTick } from "./input-timing.js";
+import { InputJournal } from "./input-journal.js";
 import { TransportPresentation } from "./transport-presentation.js";
 
 const HTTP_BYTES = 1024 * 1024;
@@ -23,7 +24,12 @@ const RESYNC_INTERVAL_MS = 5000;
 const MAX_QUEUE = 256;
 const MAX_QUEUE_BYTES = 1024 * 1024;
 const SEND_SOFT_BYTES = 256 * 1024;
-const MAX_PENDING = 64;
+const MAX_PENDING = 32;
+const MAX_REPORTED_HITS = 32;
+const INPUT_DRAIN_LIMIT = 4;
+const INPUT_BURST = 40;
+const MAX_PENDING_BYTES = 64 * 1024;
+const GAMEPLAY_QUEUE_MS = 2000;
 const ENTRY_BASELINE_AGE_MS = (PROTOCOL.INPUT_HISTORY * PROTOCOL.TICK_MS) / 2;
 const HASH = /^[a-f0-9]{64}$/;
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -142,9 +148,11 @@ export class OnlineTransport {
     this.lastEventSeq = 0;
     this.seq = 0;
     this.inputSeq = 0;
-    this.lastInputTick = -1;
+    this.initializeInputs();
     this.socket = null;
     this.pending = new Map();
+    this.completed = new Map();
+
     this.pendingTravel = 0;
     this.queue = [];
     this.queueBytes = 0;
@@ -491,6 +499,7 @@ export class OnlineTransport {
   }
 
   resetConnection() {
+    this.inputJournal.clear();
     this.renderer.clear();
     this.presentationRecovery = false;
     this.presentationReady = false;
@@ -905,6 +914,7 @@ export class OnlineTransport {
   result(message) {
     const pending = this.pending.get(message.operationId);
     if (pending) {
+      this.rememberResult(message);
       this.pending.delete(message.operationId);
       if (pending.travel) this.pendingTravel--;
       if (pending.domain) {
@@ -916,7 +926,13 @@ export class OnlineTransport {
       pending.resolve(freezeView(message));
       pending.recoverResolve?.(message);
     }
+    for (const entry of this.pending.values()) {
+      if (entry.predecessor === message.operationId) {
+        entry.parentResult = message;
+      }
+    }
     this.renderer.push("event", freezeView(message));
+    if (this.status === "active") this.recoverPending();
   }
 
   transition(message) {
@@ -924,6 +940,7 @@ export class OnlineTransport {
       throw failure("STALE_FIELD");
     }
     if (message.phase === "prepare") {
+      this.inputJournal.clear();
       this.setStatus("transitioning");
       this.shops.clear();
       const deadline =
@@ -939,6 +956,7 @@ export class OnlineTransport {
     if (message.phase === "committed") {
       if (!message.destination) throw failure("INVALID_TRANSITION");
       this.expectedFieldEpoch = message.destination.fieldEpoch;
+      this.inputJournal.clear();
       this.clock.resetField();
       this.callbacks.onTiming?.(this.clock.snapshot());
       this.lastInputTick = -1;
@@ -1027,27 +1045,91 @@ export class OnlineTransport {
       throw failure("INVALID_INPUT");
     }
     if (sample.targetTick <= this.lastInputTick) return null;
-    // The received tick is a network leg old. The server independently validates
-    // admission against its current tick, never this client's latency estimate.
-    const clock = this.clock;
-    if (
-      !clock.ready ||
-      clock.connectionEpoch !== this.connectionEpoch ||
-      clock.fieldEpoch !== this.expectedFieldEpoch ||
-      clock.paused ||
-      sample.targetTick <= clock.serverTick ||
-      sample.targetTick > clock.serverTick + inputHorizonTicks(clock)
-    ) {
+    if (!Number.isSafeInteger(this.inputSeq + 1)) {
+      throw failure("SEQUENCE_EXHAUSTED");
+    }
+    if (!this.inputJournal.push(sample, this.inputSeq + 1)) {
+      this.resync("prediction-overflow");
       return null;
     }
-    const message = this.send("input", {
-      fieldEpoch: this.expectedFieldEpoch,
-      inputSeq: this.inputSeq + 1,
-      ...sample,
-    });
-    this.inputSeq = message.inputSeq;
+    this.inputSeq++;
     this.lastInputTick = sample.targetTick;
-    return message.inputSeq;
+    this.flushInputs();
+    return this.inputSeq;
+  }
+
+  initializeInputs() {
+    this.inputJournal = new InputJournal();
+    this.lastInputTick = -1;
+    this.inputTokens = INPUT_BURST;
+    this.inputRefillAt = performance.now();
+  }
+
+  inputWindow(clock) {
+    const now = performance.now();
+    const rate = this.limits.inputPerSecond ?? INPUT_BURST;
+    this.inputTokens = Math.min(
+      INPUT_BURST,
+      this.inputTokens + ((now - this.inputRefillAt) * rate) / 1000,
+    );
+    this.inputRefillAt = now;
+    return clock.arrivalTick(now) + PROTOCOL.INPUT_LEAD_TICKS;
+  }
+
+  inputReady(clock) {
+    return !(
+      this.status !== "active" ||
+      !clock.ready ||
+      clock.paused ||
+      clock.connectionEpoch !== this.connectionEpoch ||
+      clock.fieldEpoch !== this.expectedFieldEpoch
+    );
+  }
+
+  /** Pace buffered input without changing its identity or its original target tick. */
+  flushInputs() {
+    const clock = this.clock;
+    if (!this.inputReady(clock)) return;
+    const latest = this.inputWindow(clock);
+    for (let count = 0; count < INPUT_DRAIN_LIMIT; count++) {
+      const sample = this.inputJournal.first();
+      if (
+        !sample ||
+        this.inputTokens < 1 ||
+        sample.targetTick > latest ||
+        !this.socket ||
+        this.socket.bufferedAmount > SEND_SOFT_BYTES / 2
+      ) {
+        return;
+      }
+      this.send("input", {
+        fieldEpoch: this.expectedFieldEpoch,
+        inputSeq: sample.inputSeq,
+        targetTick: sample.targetTick,
+        horizontal: sample.horizontal,
+        vertical: sample.vertical,
+        jump: sample.jump,
+        attack: sample.attack,
+        ...(sample.motion ? { motion: sample.motion } : {}),
+      });
+      this.inputTokens--;
+      this.inputJournal.shift();
+    }
+  }
+
+  /** Send provisional damage telemetry keyed to its attack without awaiting a reply.
+   *  An empty or unready report is dropped; it never determines server damage. */
+  reportHits(report) {
+    if (this.status !== "active" || !report?.hits?.length) return null;
+    const hits = report.hits.slice(0, MAX_REPORTED_HITS);
+    if (!hits.length) return null;
+    return this.send("combat.hits", {
+      fieldEpoch: this.expectedFieldEpoch,
+      feedbackId: report.feedbackId ?? null,
+      inputSeq: report.inputSeq ?? null,
+      skillId: Number(report.skillId) || 0,
+      hits,
+    });
   }
 
   command(action, expectedRevision) {
@@ -1063,7 +1145,9 @@ export class OnlineTransport {
       expectedRevision: expectedRevision ?? this.revisions[domain],
       action: structuredClone(action),
     };
+    let queue;
     try {
+      queue = this.commandCapacity(fields, domain);
       decodeClient(
         JSON.stringify({
           v: 1,
@@ -1092,13 +1176,58 @@ export class OnlineTransport {
         sentEpoch: null,
         playSession: this.playSession,
         durable: !actionEphemeral(action),
+        ...queue,
+        parentResult: null,
+        explicitRevision: expectedRevision !== undefined,
+        bound: false,
+        queuedAt: performance.now(),
       });
     });
     if (travel) this.pendingTravel++;
     promise.operationId = operationId;
-    this.callbacks.onCommand?.(freezeView(fields));
+    this.callbacks.onCommand?.(freezeView(structuredClone(fields)));
     this.sendPending(this.pending.get(operationId));
     return promise;
+  }
+
+  commandCapacity(fields, domain) {
+    const bytes = encoder.encode(JSON.stringify(fields)).byteLength;
+    let totalBytes = bytes;
+    let predecessor = null;
+    let controlAfter = null;
+    for (const entry of this.pending.values()) {
+      totalBytes += entry.bytes ?? 0;
+      if (this.controlsCast(fields.action, entry.fields.action)) {
+        controlAfter = entry.fields.operationId;
+      }
+      if (
+        entry.domain === domain &&
+        !entry.development &&
+        !this.skillControl(entry.fields.action)
+      ) {
+        predecessor = entry.fields.operationId;
+      }
+    }
+    if (totalBytes > MAX_PENDING_BYTES) {
+      throw failure("PENDING_OPERATION_LIMIT");
+    }
+    return {
+      bytes,
+      controlAfter,
+      predecessor: this.skillControl(fields.action) ? null : predecessor,
+    };
+  }
+
+  controlsCast(control, cast) {
+    return (
+      this.skillControl(control) &&
+      cast.kind === "skill.cast" &&
+      cast.skillId === control.skillId
+    );
+  }
+
+  skillControl(action) {
+    return action.kind === "skill.release" || action.kind === "skill.cancel";
   }
 
   sendPending(pending) {
@@ -1107,12 +1236,19 @@ export class OnlineTransport {
       void this.sendDevelopment(pending);
       return;
     }
+    const cast = this.pending.get(pending.controlAfter);
+    if (cast && cast.sentEpoch !== this.connectionEpoch) return;
     const now = performance.now();
-    if (now < this.nextCommandAt) return;
+    if (!this.skillControl(pending.fields.action) && now < this.nextCommandAt) {
+      return;
+    }
+    if (!this.preparePending(pending, now)) return;
     try {
       this.send("command", pending.fields);
       pending.sentEpoch = this.connectionEpoch;
-      this.nextCommandAt = now + 1000 / this.limits.commandPerSecond;
+      if (!this.skillControl(pending.fields.action)) {
+        this.nextCommandAt = now + 1000 / this.limits.commandPerSecond;
+      }
     } catch (error) {
       this.fail(error);
     }
@@ -1124,7 +1260,64 @@ export class OnlineTransport {
     }
   }
 
+  /** Bind a local intention to a revision once, just before its first transmission.
+   * Retries keep the exact original envelope; unknown predecessors remain unresolved. */
+  preparePending(pending, now) {
+    if (pending.bound) return true;
+
+    let code = null;
+    if (pending.parentResult?.status === "rejected") code = "NOT_ALLOWED";
+    if (pending.fields.fieldEpoch !== this.expectedFieldEpoch) {
+      code = "STALE_FIELD";
+    }
+    if (
+      pending.fields.action.kind === "skill.cast" &&
+      now - pending.queuedAt > GAMEPLAY_QUEUE_MS
+    ) {
+      code = "COOLDOWN";
+    }
+    if (code) {
+      this.rejectUnsent(pending, code);
+      return false;
+    }
+    if (pending.predecessor && !pending.parentResult) return false;
+    if (!pending.explicitRevision) {
+      pending.fields.expectedRevision = this.revisions[pending.domain];
+    }
+    pending.bound = true;
+    return true;
+  }
+
+  rejectUnsent(pending, code) {
+    const result = freezeView({
+      type: "operation",
+      operationId: pending.fields.operationId,
+      status: "rejected",
+      code,
+      domainRevision: this.revisions[pending.domain],
+      transactionId: null,
+    });
+    this.rememberResult(result);
+    this.pending.delete(result.operationId);
+    if (pending.travel) this.pendingTravel--;
+    pending.resolve(result);
+    pending.recoverResolve?.(result);
+    for (const entry of this.pending.values()) {
+      if (entry.predecessor === result.operationId) entry.parentResult = result;
+    }
+  }
+
+  rememberResult(result) {
+    this.completed.set(result.operationId, result);
+    if (this.completed.size > MAX_PENDING) {
+      this.completed.delete(this.completed.keys().next().value);
+    }
+  }
+
   recover(operationId) {
+    if (this.completed.has(operationId)) {
+      return Promise.resolve(this.completed.get(operationId));
+    }
     const pending = this.pending.get(operationId);
     if (!pending) return Promise.reject(failure("OPERATION_NOT_PENDING"));
     if (!pending.recovery) {
@@ -1298,7 +1491,10 @@ export class OnlineTransport {
       if (this.socket && now - this.lastMessageAt > HEARTBEAT_TIMEOUT_MS) {
         throw failure("HEARTBEAT_TIMEOUT");
       }
-      if (this.status === "active") this.recoverPending();
+      if (this.status === "active") {
+        this.flushInputs();
+        this.recoverPending();
+      }
       for (const [operationId, pending] of this.pending) {
         if (!pending.unknown && now > pending.deadline) {
           pending.unknown = true;

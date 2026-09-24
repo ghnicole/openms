@@ -10,6 +10,8 @@ import {
 
 const MAX_ACTIONS = 32;
 const RETAIN_MS = 60000;
+const MAX_ATTACK_QUEUE = 8;
+const ATTACK_QUEUE_MS = 2000;
 
 /** Local action clock owns presentation only. Server echoes identify the exact request. */
 export class LocalCombat {
@@ -19,6 +21,7 @@ export class LocalCombat {
     this.scene = null;
     this.records = new Map();
     this.active = null;
+    this.queued = [];
     this.held = false;
     this.sequence = 0;
     this.projectiles = new LocalProjectiles(this);
@@ -40,7 +43,28 @@ export class LocalCombat {
     this.bind();
     const edge = sample.attack && !this.held;
     this.held = sample.attack;
-    if (edge) this.begin(null, inputSeq);
+    if (!edge) return;
+    if (!this.current()) this.begin(null, inputSeq);
+    else if (this.queued.length < MAX_ATTACK_QUEUE) {
+      this.queued.push({
+        identity: inputSeq,
+        expires: this.now() + ATTACK_QUEUE_MS,
+      });
+    }
+  }
+  update() {
+    const now = this.now();
+    for (let count = 0; count < MAX_ATTACK_QUEUE; count++) {
+      const next = this.queued[0];
+      if (!next) return;
+      if (next.expires < now) this.queued.shift();
+      else if (this.current(now)) return;
+      else {
+        this.queued.shift();
+        this.begin(null, next.identity);
+        return;
+      }
+    }
   }
   begin(skillId, identity) {
     this.bind();
@@ -104,12 +128,17 @@ export class LocalCombat {
     if (record) record.confirmed = true;
     if (entity.combatState?.phase === "dead") {
       this.reject(this.active);
+      this.queued.length = 0;
       this.incoming.motion?.clear();
       this.incoming.hitRemainingMs = 0;
     }
   }
-  movementLock(message) {
+  movementLock(message, predictedLock) {
     if (message.authoritative) return message.motion.movementLocked;
+    if (predictedLock !== undefined) {
+      if (message.combat?.locked && !this.match(message.combat)) return true;
+      return predictedLock;
+    }
     if (this.current()) return true;
     if (message.combat?.locked && this.match(message.combat)) return false;
     return message.motion.movementLocked;
@@ -194,5 +223,6 @@ export class LocalCombat {
     this.records.clear();
     this.active = null;
     this.held = false;
+    this.queued.length = 0;
   }
 }

@@ -93,10 +93,11 @@ const prediction = new OnlinePrediction({
   onInput: sendInput,
   onResync: resync,
   onGroundJump: () => ui?.audio.playSound("Game", "Jump").catch(report),
-  onMovementLock: (message) => ui.localCombat.movementLock(message),
+  onMovementLock: (message, predictedLock) =>
+    ui.localCombat.movementLock(message, predictedLock),
 });
-// A resumed session offers its locally presented motion: the client owns its position
-// across the reconnect gap and the server adopts it instead of snapping the player back.
+// A resumed session offers diagnostic motion; the server retains position authority
+// across the reconnect gap and returns a checkpoint for reconciliation.
 transport.resumeMotion = () => prediction.resumeMotion();
 
 function reportCause(error) {

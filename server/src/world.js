@@ -86,12 +86,15 @@ import {
 } from "./field-diverts.js";
 import { serverOwnsPosition, combatMotionOwner } from "./motion-authority.js";
 import { MotionWatchdog } from "./watchdog.js";
-import { adoptMotion } from "./motion-adoption.js";
+import { DamageWatchdog } from "./damage-watchdog.js";
 import { retainAttackInput, resetAttackInput } from "./attack-input.js";
 
 const MAX_FIELDS = 128;
 const MAX_ACTORS = 128;
 const MAX_DEBT_MS = 5000;
+/** Bounded client-rolled damage evidence per actor before and during an attack. */
+const MAX_HIT_REPORTS = 32;
+const MAX_HIT_REPORT_AGE_TICKS = 300;
 const NEUTRAL = Object.freeze({
   horizontal: 0,
   vertical: 0,
@@ -130,11 +133,8 @@ function prepareNpcs(manifest, randomUint) {
   return npcs;
 }
 
-/** Whether the client's report for this tick may be adopted at all. The browser owns
- *  its own trajectory, so ordinary motion is always adopted; only state the client
- *  cannot predict is refused here. Those checkpoints are also published with
- *  `authoritative: true` so the browser follows them. */
-function adoptionPermitted(actor, sim) {
+/** Explicit server relocations are not comparable to an earlier client preview. */
+function reportComparable(actor, sim) {
   if (actor.state !== "active" || actor.retiring || actor.deliveryError) {
     return false;
   }
@@ -173,11 +173,11 @@ function peerMotionSignature(entity) {
   return JSON.stringify(entity);
 }
 
-function adoptReportedMotion(world, actor, sample) {
+function inspectReportedMotion(world, actor, sample) {
   const motion = sample.motion;
   const sim = actor.simulation;
   if (!motion || !sim) return;
-  if (!adoptionPermitted(actor, sim)) return;
+  if (!reportComparable(actor, sim)) return;
   const elapsedMs =
     Math.max(0, sample.targetTick - actor.lastAdoptedTick) * PROTOCOL.TICK_MS;
   const excess = motionExcess(sim, motion, plausiblePositionPx(elapsedMs));
@@ -187,7 +187,8 @@ function adoptReportedMotion(world, actor, sample) {
     world.faultMotion(actor, { ...excess, elapsedMs, verdict });
     return;
   }
-  adoptMotion(sim, motion);
+  // A report never changes the trusted kernel. Validation is the server's own
+  // input simulation; the optional watchdog only adds abuse evidence.
   actor.lastAdoptedTick = sample.targetTick;
 }
 
@@ -199,7 +200,7 @@ function consumeActorInput(world, actor) {
     actor.inputQueue.delete(actor.field.tick);
     actor.currentInputSeq = sample.inputSeq;
     assignHeldInput(actor.input, sample);
-    adoptReportedMotion(world, actor, sample);
+    inspectReportedMotion(world, actor, sample);
     actor.ackInputSeq = Math.max(actor.ackInputSeq ?? 0, sample.inputSeq);
     actor.lastInputTick = actor.field.tick;
   } else if (actor.field.tick - actor.lastInputTick > 3) {
@@ -228,6 +229,7 @@ export class OnlineWorld {
     publish,
     development = false,
     watchdogEnabled = false,
+    combatWatchdogEnabled = true,
     log = null,
   }) {
     this.content = content;
@@ -249,6 +251,10 @@ export class OnlineWorld {
     this.random = () => this.nextUint32() / 0x100000000;
     this.watchdog = new MotionWatchdog({
       enabled: watchdogEnabled,
+      log: this.log,
+    });
+    this.damageWatchdog = new DamageWatchdog({
+      enabled: combatWatchdogEnabled,
       log: this.log,
     });
   }
@@ -419,10 +425,7 @@ export class OnlineWorld {
     prepareMotionDiverts(actor, field);
   }
 
-  /** A resumed client is the source of truth for its own position: adopt the motion it
-   *  presented while the socket was gone, judged by the same watchdog against the gap.
-   *  A player who kept walking is restored where they are, not where the server last saw
-   *  them; motion no kernel could have produced in that time closes the session. */
+  /** Resume reports are diagnostics only. Reconnection never grants client position. */
   adoptResumedMotion(actor, motion) {
     if (!resumableResume(actor, motion)) return;
     const elapsedMs =
@@ -438,10 +441,7 @@ export class OnlineWorld {
       this.faultMotion(actor, { ...excess, elapsedMs, verdict });
       throw protocolError("NOT_ALLOWED");
     }
-    adoptMotion(actor.simulation, motion);
     actor.lastAdoptedTick = actor.field.tick;
-    actor.profile.location.x = actor.simulation.x;
-    actor.profile.location.y = actor.simulation.y;
   }
 
   leave(actor) {
@@ -509,6 +509,55 @@ export class OnlineWorld {
       throw protocolError("RATE_LIMITED");
     }
     actor.inputQueue.set(message.targetTick, message);
+  }
+
+  /** Retain bounded diagnostic lines keyed to an attack. Only a matching server
+   *  resolution consumes them; reported values never change combat outcomes. */
+  recordHits(actor, message) {
+    if (this.closed || actor.state !== "active" || !actor.field) {
+      throw protocolError("NOT_ALLOWED");
+    }
+    const identity = message.feedbackId ?? message.inputSeq;
+    if (identity === null || identity === undefined) {
+      throw protocolError("INVALID_MESSAGE");
+    }
+    const reports = (actor.hitReports ??= new Map());
+    const lines = new Map();
+    for (const hit of message.hits) {
+      lines.set(`${hit.targetId}:${hit.line}`, {
+        damage: hit.damage,
+        critical: hit.critical,
+      });
+    }
+    reports.set(String(identity), {
+      skillId: message.skillId,
+      tick: actor.field.tick,
+      lines,
+    });
+    while (reports.size > MAX_HIT_REPORTS) {
+      reports.delete(reports.keys().next().value);
+    }
+  }
+
+  /** Consume one reported line for the attack identity the authority is resolving now. */
+  takeReportedDamage(actor, identity, targetId, hit) {
+    if (identity === null || identity === undefined) return null;
+    const key = String(identity);
+    const report = actor.hitReports?.get(key);
+    if (!report) return null;
+    if (
+      actor.field.tick - report.tick > MAX_HIT_REPORT_AGE_TICKS ||
+      report.skillId !== hit.skillId
+    ) {
+      actor.hitReports.delete(key);
+      return null;
+    }
+    const lineKey = `${targetId}:${hit.line}`;
+    const entry = report.lines.get(lineKey);
+    if (!entry) return null;
+    report.lines.delete(lineKey);
+    if (!report.lines.size) actor.hitReports.delete(key);
+    return entry;
   }
 
   async command(actor, message) {
@@ -613,9 +662,7 @@ export class OnlineWorld {
     actor.profile.location.facing = actor.simulation.facing;
   }
 
-  /** Motion the kernel cannot explain from the inputs and events this process owns is a
-   *  client fault. The session is closed instead of nudged: the client's trajectory is
-   *  its own source of truth right up to the point where it stops being possible. */
+  /** Optional abuse enforcement; server motion and client correction are independent. */
   faultMotion(actor, detail) {
     if (actor.retiring) return;
     actor.retiring = true;

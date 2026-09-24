@@ -1,3 +1,4 @@
+import { OptimisticProfile } from "./optimistic-profile.js";
 import { SOCIAL_MESSAGES } from "../../../shared/social-feedback.js";
 
 const OPERATION_MESSAGES = Object.freeze({
@@ -14,14 +15,15 @@ export class NativeOperationRefusal extends Error {
   }
 }
 
-/** A read-only publication source. It deliberately has no save, flush or mutation methods. */
+/** Read-only confirmed state plus disposable previews; never a save target. */
 export class NativeProfileSource {
   constructor(owner) {
     this.owner = owner;
     this.listeners = new Set();
+    this.optimistic = new OptimisticProfile(owner);
   }
   get profile() {
-    return this.owner.state?.presentation.profile ?? null;
+    return this.optimistic.profile();
   }
   get id() {
     return this.owner.state?.self.entity.id ?? null;
@@ -46,6 +48,7 @@ export class NativeProfileSource {
     for (const listener of this.listeners) listener(this);
   }
   destroy() {
+    this.optimistic.clear();
     this.listeners.clear();
   }
 }

@@ -94,23 +94,6 @@ function faults(probe) {
   );
 }
 
-/** A kernel step from the client-reported base, using the input the server consumed. */
-function stepFrom(probe, report) {
-  const sim = createSimulation(probe.field.manifest.physics, {
-    x: report.x,
-    y: report.y,
-    facing: 1,
-  });
-  sim.x = report.x;
-  sim.y = report.y;
-  sim.previousX = report.x;
-  sim.previousY = report.y;
-  sim.vx = report.vx;
-  sim.vy = report.vy;
-  stepMotion(sim, probe.actor.input);
-  return captureMotion(sim);
-}
-
 function dispose(probe) {
   for (const actor of probe.world.actors.values()) {
     disposeActorSkills(actor, true);
@@ -139,7 +122,7 @@ function advance(probe, ticks) {
   }
 }
 
-test("walking across footholds through a delivery stall remains valid after input becomes neutral", async () => {
+test("missing movement becomes neutral and later reports cannot grant the lost travel", async () => {
   const probe = await fixture(10000);
   try {
     const { actor, world, field } = probe;
@@ -174,7 +157,7 @@ test("walking across footholds through a delivery stall remains valid after inpu
       ).not.toBe(true);
     }
     expect(faults(probe)).toEqual([]);
-    expect(Math.abs(actor.simulation.x - client.x)).toBeLessThan(1);
+    expect(Math.abs(actor.simulation.x - client.x)).toBeGreaterThan(50);
   } finally {
     dispose(probe);
   }
@@ -206,7 +189,7 @@ test("admitted jumps and departures release stale ground and ladder contacts wit
   }
 });
 
-test("a client-reported position inside the envelope becomes the server's state", async () => {
+test("even a small client-reported displacement cannot replace the server kernel", async () => {
   const probe = await fixture();
   try {
     const { world, field, actor } = probe;
@@ -214,14 +197,13 @@ test("a client-reported position inside the envelope becomes the server's state"
     actor.simulation.y = 0;
     actor.simulation.vx = 0;
     actor.simulation.vy = 0;
+    const expected = createSimulation(field.manifest.physics, { x: 0, y: 0 });
+    restoreMotion(expected, captureMotion(actor.simulation));
+    stepMotion(expected, createHeldInput());
     const report = { x: 3, y: -1, vx: 120, vy: 0 };
     world.input(actor, input(actor, report));
     advance(probe, 1);
-    // The report is the base of this tick's step, not a target the kernel glides to.
-    expect(actor.simulation.previousX).toBe(report.x);
-    expect(actor.simulation.previousY).toBe(report.y);
-    const expected = stepFrom(probe, report);
-    expect(captureMotion(actor.simulation)).toEqual(expected);
+    expect(captureMotion(actor.simulation)).toEqual(captureMotion(expected));
     expect(faults(probe)).toEqual([]);
     expect(actor.lastAdoptedTick).toBe(field.tick);
   } finally {
@@ -244,17 +226,15 @@ test("a report without motion leaves the authoritative simulation untouched", as
   }
 });
 
-test("a seat or a pending transition refuses adoption while an ordinary lock does not", async () => {
+test("ordinary locks, seats and transitions all retain server position", async () => {
   const probe = await fixture();
   try {
     const { world, actor } = probe;
     place(actor, 0, 0);
-    // The browser owns XY during an action lock: the client predicts the same locked
-    // kernel, so its report is adopted as usual.
     actor.simulation.movementLocked = true;
     world.input(actor, input(actor, { x: 5, y: -2, vx: 100, vy: 0 }));
     advance(probe, 1);
-    expect(actor.simulation.previousX).toBe(5);
+    expect(actor.simulation.previousX).toBe(0);
     actor.simulation.movementLocked = false;
     // An authored seat is server-owned and keeps the authority's own state.
     actor.simulation.seat = { x: 0, y: 0 };
@@ -274,7 +254,7 @@ test("a seat or a pending transition refuses adoption while an ordinary lock doe
   }
 });
 
-test("an isolated deviation is adopted and only recorded, never punished", async () => {
+test("an isolated deviation is recorded without moving or punishing the character", async () => {
   const probe = await fixture();
   try {
     const { world, actor } = probe;
@@ -283,7 +263,7 @@ test("an isolated deviation is adopted and only recorded, never punished", async
     const report = { x: plausiblePositionPx(30) + 8, y: 0, vx: 0, vy: 0 };
     world.input(actor, input(actor, report));
     advance(probe, 1);
-    expect(actor.simulation.previousX).toBe(report.x);
+    expect(actor.simulation.previousX).toBe(0);
     expect(faults(probe)).toEqual([]);
     expect(world.watchdog.snapshot().suspicious).toBe(1);
   } finally {
@@ -334,7 +314,7 @@ test("one impossible report faults immediately and is not adopted", async () => 
   }
 });
 
-test("the envelope scales with the gap so a reconnect keeps the client's position", async () => {
+test("a plausible reconnect report cannot replace trusted position", async () => {
   const probe = await fixture();
   try {
     const { world, field, actor } = probe;
@@ -346,9 +326,11 @@ test("the envelope scales with the gap so a reconnect keeps the client's positio
     expect(plausiblePositionPx(gapTicks * PROTOCOL.TICK_MS)).toBeGreaterThan(
       600,
     );
+    const before = captureMotion(actor.simulation);
+    const location = { ...actor.profile.location };
     world.adoptResumedMotion(actor, walked);
-    expect(actor.simulation.x).toBe(walked.x);
-    expect(actor.profile.location.x).toBe(walked.x);
+    expect(captureMotion(actor.simulation)).toEqual(before);
+    expect(actor.profile.location).toEqual(location);
     expect(faults(probe)).toEqual([]);
   } finally {
     dispose(probe);
@@ -385,9 +367,7 @@ for (const value of ["false", "true"]) {
       const report = { x: 10000, y: 0, vx: 0, vy: 0 };
       world.input(actor, input(actor, report));
       advance(probe, 1);
-      expect(actor.simulation.previousX === report.x).toBe(
-        !config.watchdogEnabled,
-      );
+      expect(actor.simulation.previousX).not.toBe(report.x);
       expect(Boolean(actor.retiring)).toBe(config.watchdogEnabled);
       expect(faults(probe).length > 0).toBe(config.watchdogEnabled);
       if (!config.watchdogEnabled) {
@@ -405,20 +385,21 @@ for (const value of ["false", "true"]) {
   });
 }
 
-test("disabled watchdog accepts reconnect discrepancies while finite and seat guards remain", async () => {
+test("disabled watchdog still cannot grant position through reconnect", async () => {
   const probe = await fixture(100000000, false);
   try {
     const { world, actor } = probe;
     place(actor, 0, 0);
     const report = { x: 10000, y: 0, vx: 0, vy: 0 };
+    const location = { ...actor.profile.location };
     world.adoptResumedMotion(actor, report);
-    expect(actor.simulation.x).toBe(report.x);
-    expect(actor.profile.location.x).toBe(report.x);
+    expect(actor.simulation.x).toBe(0);
+    expect(actor.profile.location).toEqual(location);
     world.adoptResumedMotion(actor, { ...report, x: NaN });
-    expect(actor.simulation.x).toBe(report.x);
+    expect(actor.simulation.x).toBe(0);
     actor.simulation.seat = { x: 10000, y: 0 };
     world.adoptResumedMotion(actor, { ...report, x: 20000 });
-    expect(actor.simulation.x).toBe(report.x);
+    expect(actor.simulation.x).toBe(0);
     expect(Boolean(actor.retiring)).toBe(false);
     expect(faults(probe)).toEqual([]);
     expect(world.watchdog.snapshot().actors).toEqual([]);

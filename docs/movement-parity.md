@@ -28,49 +28,27 @@ flowchart TD
   Checkpoint --> Predictor
 ```
 
-The browser restores authoritative coefficients from motion checkpoints. Its own motion is the source of truth for its position unless the server owns the transition (see [client-owned motion](#client-owned-motion)) and a watchdog refutes it. The shared helper preserves equipment and buff semantics without expanding the set of supported movement controllers.
+The browser predicts movement immediately, then restores server checkpoints and replays retained inputs. The server owns consequential positions, including ordinary movement. The shared helper preserves equipment and buff semantics without expanding the set of supported movement controllers.
 
 ## Client-owned motion
 
-Product priority: the browser is the source of truth for the character's own XY, and the
-authority never corrects an ordinary trajectory. A movement skill, a midair mob hit or a
-knockback must not produce a visible stall, snap or rubber-band, so the client applies
-its own impulses and the server only observes. This also removes the round trip that made
-mid-air skill use feel laggy when the client was connected but not when it ran offline.
+The client owns immediate presentation. The server owns legal movement. The former client-position-adoption policy was replaced by the [optimistic-client implementation](optimistic-client.md) to preserve the authority boundary while retaining responsive controls.
 
-| Contract                           | Owner                                                                                                              | Behaviour                                                                                                                                                                                                                                                                                                                                                                         |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `input.motion` (`x`,`y`,`vx`,`vy`) | `OnlinePrediction.predict` → `OnlineWorld.input`                                                                   | Each input sample reports the state it extends (end of `targetTick - 1`), bounded to the same ±1048576 range as a checkpoint. `Transport.neutral` heartbeats omit it.                                                                                                                                                                                                             |
-| Adoption                           | `adoptReportedMotion` in [world.js](../server/src/world.js) · [Contact adoption](../server/src/motion-adoption.js) | Ordinary reports become the server's tick base after watchdog review; the server keeps its own state only while it owns the position (see below). Ground contact must contain the reported point and tangent velocity. Stale foothold/ladder references are released, and matching ground uses the kernel's `009b1553` attachment.                                                |
-| Server-owned checkpoints           | `serverOwnsPosition` in [motion-authority.js](../server/src/motion-authority.js)                                   | The published `motion` frame carries `authoritative: true` only for a pending field transition, death, an authored seat, or a movement skill the browser does not simulate (teleport, rush/assault, dash, wings) — `SkillWorldController.ownsMotion`. Only those frames replace the client's kernel.                                                                              |
-| Ordinary checkpoints               | `OnlinePrediction.adoptControls`                                                                                   | A frame with `authoritative: false` updates timing, acknowledgement and server-owned _controls_ — `effectiveSettings` (buff/shoe/form speeds), `worldMovement`, `movementLocked` and `seat` — but never `x`/`y`/`vx`/`vy`. The drawn pose is untouched, so no correction glide can stall the player.                                                                              |
-| Impulses                           | `motion.diverts[]` in [protocol.js](../shared/protocol.js)                                                         | A server-owned impulse (mob knockback or a movement skill) is published with its exact `{vx, vy}`, its `source` and its `skillId`. The client merges the vector into its **current** kernel state through the same `applyExternalImpulse` entry point, so the trajectory is the original one; it is never restored from a pre-impulse checkpoint.                                 |
-| Optimistic movement skills         | `OnlinePrediction.beginOptimistic`                                                                                 | A predicted `impulse` skill is merged at the key press. The matching `source: "skill"` divert is retired by `skillId` and not merged twice. A refused cast calls `rejectOptimistic`, restoring the exact pre-cast checkpoint so an unadmitted impulse cannot survive.                                                                                                             |
-| Watchdog                           | [watchdog.js](../server/src/watchdog.js)                                                                           | The authority records motion the kernel cannot explain and judges it against `MOTION_PLAUSIBILITY` (900 px/s of elapsed gap plus 500 ms latency allowance, ≥32 px floor, 700 px/s velocity difference). Reports within 50 ticks count as one incident; eight incidents in 900 ticks close the session. A hard fault requires >8× the envelope, with a 4096 px displacement floor. |
-| Resume                             | `World.adoptResumedMotion`                                                                                         | A resumed client offers its locally presented motion in `hello.resume.motion`; the same watchdog judges it against the disconnect gap, so a player who kept moving resumes where they are instead of snapping back.                                                                                                                                                               |
+| Contract | Owner | Behavior |
+| --- | --- | --- |
+| Local input | `OnlinePrediction.predict`, outgoing input journal | Fixed 30 ms prediction proceeds before a packet is sent; up to 128 unsent samples retain original input identities. |
+| Motion hints | `inspectReportedMotion`, `World.adoptResumedMotion` | Optional bounded XY/velocity reports are diagnostics. Neither ordinary reports nor reconnect installs client position or velocity. |
+| Checkpoints | `OnlinePrediction.adoptCheckpoint` | Every checkpoint restores trusted continuation and replays the retained suffix silently. Normal corrections are smoothed in presentation space. |
+| Forced movement | `serverOwnsPosition` | The legacy `authoritative` wire flag marks death, transitions, seats and unpredicted movement skills. It additionally retires incompatible local impulses; `false` does not grant client authority. |
+| Impulses | `motion.diverts`, `beginOptimistic` | Local movement skills start immediately. A matching divert retires the preview and replay starts from the checkpoint containing the server impulse. Rejection rebases on the latest trusted checkpoint; a departed-field token cannot restore old motion. |
+| Watchdog | [watchdog.js](../server/src/watchdog.js) | Optional discrepancy evidence/kicks supplement independent movement simulation. Inside-tolerance reports still cannot move the server actor. |
+| Reconnect | Connection epoch plus server checkpoint | Retires the previous input journal and restores current server state; no time or distance is granted for a claimed disconnected trajectory. |
 
-Because the client no longer replays a pre-impulse checkpoint, `before` is gone from the
-divert schema: only the event vector, source, skill id and optional hit source id cross the wire. The server no
-longer refuses adoption to protect a divert, and `movementLocked` no longer withholds
-position ownership.
+The watchdog remains off by default. `OPENMS_MOTION_WATCHDOG_ENABLED=true` in `.env.server` enables its lag-tolerant evidence policy after restart. This changes diagnostics and kicking, never server authority or reconciliation.
 
-Delayed reports can cross several foothold segments before the next sample is admitted. Adoption retains an existing contact only while the reported point and velocity still match it. A changed contact searches bounded, validated geometry for the actual supporting segment; a point in air is never snapped to a nearby floor. This prevents the next server step from projecting a valid report back onto an old segment and manufacturing an impossible displacement. The numerical contact tolerance is 0.000001 pixels, with the same tolerance for normal velocity; this contact fix is independent of the current lag-tolerant watchdog policy. [Scoped regression](validation.md#watchdog-contact-and-retirement-repair) reproduces the old false kick on map 10000.
+Prediction is bounded by 128 history entries and a five-second stale observation threshold, and stops on disconnect. These are recovery limits, not an offline-play guarantee. A longer upstream stall may lose movement outside the server input window; historical trajectory reconstruction is not implemented. Unpredicted teleport/rush/dash/wings still follow server checkpoints. The shared kernel retains original geometry, movement coefficients and contact rules.
 
-The watchdog is currently off by default. Set `OPENMS_MOTION_WATCHDOG_ENABLED=true` in `.env.server` and restart the server to enable the table's watchdog policy; `false` disables discrepancy evidence and kicks for both ordinary reports and reconnects. Input validation and server-owned position admission still apply.
-
-Known limitations:
-
-- After five seconds without authenticated movement timing, the client requests a fresh
-  snapshot. Prediction can stop sooner at its bounded input horizon or when the connection
-  closes; five seconds is a recovery threshold, not a promise of continued movement.
-  The resume handoff reports wherever the client actually stopped.
-- Movement skills the browser does not simulate (teleport, rush, dash, wings) remain
-  server-owned and arrive as `authoritative` checkpoints at the 30 ms field cadence rather
-  than as locally predicted motion.
-- Presentation still samples only `presentation.x/y` in `bun tools/openms.js smoothness`, which
-  holds one key. Divert continuity is proven by `client/test/divert-alignment.test.js` and
-  `server/test/hit-divert-replay.test.js` (a real midair mob knockback published by the
-  production field and merged by a real predictor) rather than by that tool.
+Focused continuation checks:
 
 ```sh
 bun test client/test/divert-alignment.test.js server/test/hit-divert-replay.test.js server/test/motion-adoption.test.js
@@ -78,7 +56,7 @@ bun test client/test/divert-alignment.test.js server/test/hit-divert-replay.test
 
 ## Latency and input timing
 
-The most recently received server tick is already one network leg old. [Input timing](../client/src/online/input-timing.js) estimates when a sample will reach the server, then bounds the client horizon by the measured round trip plus eight ticks, capped below the 128-sample history capacity. The server independently admits samples within eight ticks of its **current** field tick. Applying that same eight-tick cap to an old received tick would make ordinary 500 ms RTT traffic arrive too late.
+The most recently received server tick is already one network leg old. [Input timing](../client/src/online/input-timing.js) estimates when a sample will reach the server and advances through delayed observations while its 128-sample history and stale-observation limits permit. The server independently admits samples within eight ticks of its **current** field tick. Applying that same eight-tick cap to an old received tick would make ordinary 500 ms RTT traffic arrive too late.
 
 Late or prematurely scheduled samples are acknowledged and retired without disconnecting the session. Brief delivery bursts and outlying heartbeat measurements have separate bounded handling. Active movement observations and impulses continue during same-field artwork refreshes; a long initial load obtains a fresh baseline before enabling input. These are transport policies; the recovered 30 ms physics step and movement coefficients remain unchanged. [Protocol limits](server/protocol.md#slow-connections-and-presentation-recovery) define the bounds, and the [500 ms RTT check](validation.md#slow-network-gameplay-repair) records the exercised workload.
 

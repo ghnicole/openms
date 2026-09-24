@@ -187,6 +187,38 @@ test("large generated damage survives publication while hpDamage is only HP actu
   expect(() => validate(event, domainEventSchema)).not.toThrow();
 });
 
+test("an admitted attack ignores forged damage and critical reports even without a watchdog", async () => {
+  const { world, actor, mob, publications } = await fixture();
+  world.damageWatchdog = null;
+  world.recordHits(actor, {
+    feedbackId: "prediction",
+    skillId: 0,
+    hits: [{ targetId: mob.id, line: 0, damage: DAMAGE_LIMIT, critical: true }],
+  });
+  const hp = mob.hp;
+  actor.skillField.damageTarget(
+    mob,
+    1,
+    {
+      reportId: "prediction",
+      skillId: 0,
+      skillLine: true,
+      line: 0,
+      critical: false,
+      knockbackChance: 0,
+      roll: 0,
+    },
+    1,
+  );
+  const event = publications.find(
+    (entry) => entry.event?.kind === "combat.impact",
+  ).event;
+  expect(event.damage).toBe(1);
+  expect(event.critical).toBe(false);
+  expect(mob.hp).toBe(hp - 1);
+  expect(actor.hitReports.size).toBe(0);
+});
+
 test("a reserved projectile owns its action identity after the field starts another action", async () => {
   const { actor } = await fixture();
   actor.skillField.feedbackId = "first";

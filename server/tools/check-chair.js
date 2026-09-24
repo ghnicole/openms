@@ -21,7 +21,13 @@ async function seed(database, content) {
     });
     profile.name = name === "sitter" ? "Sitter" : "Witness";
     profile.settings.BGM.mute = true;
-    if (name === "sitter") grantItem(profile, content.items[3010000], 1);
+    if (name === "sitter") {
+      grantItem(profile, content.items[3010000], 1);
+      profile.hp = profile.maxHP;
+      profile.mp = 0;
+      profile.baseMaxMP = 100;
+      profile.maxMP = 100;
+    }
     await database.createCharacter(account.id, profile);
   }
 }
@@ -33,7 +39,7 @@ if (import.meta.main) {
   });
   if (flags.help) {
     console.log(
-      "bun server/tools/check-chair.js [--output DIR]\nDefault: /tmp/openms-chair. Disposable account/database; native setup-tab chair use and resident sit pose.",
+      "bun server/tools/check-chair.js [--output DIR]\nDefault: /tmp/openms-chair. Disposable accounts/database; native chair use, seated MP recovery and project-bar player count.",
     );
   } else {
     const report = await isolatedOnlineCheck({

@@ -62,6 +62,15 @@ function watchdogEnabled(value) {
   return value === "true";
 }
 
+/** Damage evidence is cheap and always worth keeping; it can be turned off explicitly. */
+function combatWatchdogEnabled(value) {
+  if (value === undefined) return true;
+  if (value !== "true" && value !== "false") {
+    throw new Error("OPENMS_COMBAT_WATCHDOG_ENABLED must be true or false");
+  }
+  return value === "true";
+}
+
 /** Origins stay exact in every mode; only host configuration decides transport. */
 export function serverConfig(environment = loadEnvironment("server")) {
   const development = environment.OPENMS_MODE === "development";
@@ -95,6 +104,9 @@ export function serverConfig(environment = loadEnvironment("server")) {
     powBits: proofBits(environment.OPENMS_POW_BITS),
     watchdogEnabled: watchdogEnabled(
       environment.OPENMS_MOTION_WATCHDOG_ENABLED,
+    ),
+    combatWatchdogEnabled: combatWatchdogEnabled(
+      environment.OPENMS_COMBAT_WATCHDOG_ENABLED,
     ),
     sessionMs: 12 * 60 * 60 * 1000,
     reconnectMs: 30_000,

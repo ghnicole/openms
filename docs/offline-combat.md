@@ -103,6 +103,8 @@ Native exclusion helpers `004f0d45/004f0d64`, temporary authored HP/MP secondary
 
 `hooks.onRecovery(amount,simulation)` forwards HP only to `CombatPresentation.onRecovery`. Revival is a separate UI/map transition, not a natural-recovery timer.
 
+The online authority uses the same independent MP timer while sitting on a chair or map seat, including at full HP. MP changes appear in the MP bar without floating recovery numbers. The focused `bun server/tools/check-chair.js --output /tmp/openms-chair` scenario uses an owned chair through native inventory input, checks MP recovery with full HP and preservation after reconnect, and checks the project-bar player count as another participant disconnects. It also checks the bar at 1280×800 and 800×600; existing extracted assets are reused.
+
 ## Player world name
 
 `PlayerName(scene,store)` owns a persistent text/background attachment under the actor's native depth group, with position derived from the unflipped world vector. `step(resolution)` follows presentation projection and rebuilds geometry only when the current `store.profile.name` or backing density changes. Equipment replacement reparents field-owned attachments before destroying the old actor. The name reacquires the profile after atomic edits; `destroy()` releases its children. Unchanged RAF frames do not reconstruct text.

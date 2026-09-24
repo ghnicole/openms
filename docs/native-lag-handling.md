@@ -1,5 +1,9 @@
 # Original client lag handling
 
+For the proposed OpenMS prediction, action-queue and server-authority design, see
+[Optimistic client and delayed actions](optimistic-client.md). This page records
+original-client evidence; that proposal separates immediate feedback from trusted outcomes.
+
 ## Scope and provenance
 
 This is decompilation evidence from the supplied `Maplestory_UNPACKED.exe`, SHA-256

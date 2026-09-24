@@ -10,7 +10,6 @@ import {
   assignHeldInput,
   stepMotion,
   captureMotion,
-  restoreMotion,
 } from "../../shared/motion.js";
 
 /** Synthetic isolating geometry, not an original-game recording. Mirrors the
@@ -131,24 +130,23 @@ test("a reported sample carries the state it extends, bounded and normalized", (
   });
 });
 
-test("an ordinary checkpoint is an observation and never repositions the client", () => {
+test("an ordinary checkpoint corrects the kernel and replays the remaining inputs", () => {
   const { prediction, simulation } = predicting(8);
-  const before = captureMotion(simulation);
-  // The server reports its own (older) trajectory with no impulse; the browser owns XY.
   const server = createSimulation(world(), { x: 500, y: -10 });
   server.effectiveSettings.walkSpeed = 200;
   server.movementLocked = true;
   prediction.observe(checkpoint(server, 4));
-  expect(simulation.x).toBe(before.x);
-  expect(simulation.y).toBe(before.y);
-  expect(simulation.vx).toBe(before.vx);
-  expect(simulation.vy).toBe(before.vy);
-  // Server-owned controls are still adopted: coefficients, forms and locks.
+  const held = createHeldInput();
+  for (let tick = 5; tick <= 8; tick++) {
+    assignHeldInput(held, sample(tick));
+    stepMotion(server, held);
+  }
+  expect(captureMotion(simulation)).toEqual(captureMotion(server));
   expect(simulation.effectiveSettings.walkSpeed).toBe(200);
   expect(simulation.movementLocked).toBe(true);
   expect(prediction.snapshot().diverts).toBe(0);
-  expect(prediction.snapshot().corrections).toBe(0);
-  expect(prediction.snapshot().replayedTicks).toBe(0);
+  expect(prediction.snapshot().corrections).toBe(1);
+  expect(prediction.snapshot().replayedTicks).toBe(4);
 });
 
 test("an authoritative checkpoint replaces the local kernel exactly", () => {
@@ -160,23 +158,23 @@ test("an authoritative checkpoint replaces the local kernel exactly", () => {
   expect(captureMotion(simulation)).toEqual(captureMotion(server));
 });
 
-test("a mob knockback merges into the client's own current state", () => {
+test("a confirmed knockback is replayed from its checkpoint without applying it twice", () => {
   const { prediction, simulation } = predicting(8);
-  const before = captureMotion(simulation);
-  // The original impulse vector: horizontal 270 away from the mob, vertical -270.
+  const server = predicting(4).simulation;
+  applyExternalImpulse(server, 270, -270);
   prediction.observe(
-    checkpoint(simulation, 4, [
+    checkpoint(server, 4, [
       { tick: 4, vx: 270, vy: -270, source: "hit", skillId: 0 },
     ]),
   );
-  // The result is the shared kernel merge of the client's own pre-receipt state,
-  // never the authority's post-impulse checkpoint.
-  const reference = createSimulation(world(), { x: 0, y: -10 });
-  restoreMotion(reference, before);
-  applyExternalImpulse(reference, 270, -270);
-  expect(captureMotion(simulation)).toEqual(captureMotion(reference));
+  const held = createHeldInput();
+  for (let tick = 5; tick <= 8; tick++) {
+    assignHeldInput(held, sample(tick));
+    stepMotion(server, held);
+  }
+  expect(captureMotion(simulation)).toEqual(captureMotion(server));
   expect(prediction.snapshot().diverts).toBe(1);
-  expect(prediction.snapshot().corrections).toBe(0);
+  expect(prediction.snapshot().corrections).toBe(1);
 });
 
 test("an optimistic movement skill is applied once and its divert is retired", () => {
@@ -226,12 +224,24 @@ test("a refused optimistic cast restores the exact pre-cast checkpoint", () => {
   expect(prediction.snapshot().pendingImpulses).toBe(0);
 });
 
-test("a checkpoint without diverts is a pure observation", () => {
-  const { prediction, simulation } = predicting(8);
+test("a matching older checkpoint replays silently to the identical current pose", () => {
+  const { prediction, simulation, sent } = predicting(8);
   const before = captureMotion(simulation);
-  prediction.observe(checkpoint(simulation, 4));
+  const server = predicting(4).simulation;
+  prediction.observe(checkpoint(server, 4));
   expect(prediction.snapshot().diverts).toBe(0);
   expect(captureMotion(simulation)).toEqual(before);
+  expect(sent).toHaveLength(8);
+});
+
+test("local simulation advances even when transport cannot send", () => {
+  const { prediction, simulation } = predicting(8);
+  prediction.onInput = () => null;
+  const x = simulation.x;
+  const held = createHeldInput();
+  held.right = true;
+  expect(prediction.predict(held, true)).toBe(true);
+  expect(simulation.x).toBeGreaterThan(x);
 });
 
 test("the same history and impulses reproduce captureMotion exactly, once", () => {

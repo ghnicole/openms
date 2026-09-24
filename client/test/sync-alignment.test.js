@@ -423,6 +423,7 @@ test("a paused portal transition keeps drawing the local player from its own pre
     native: null,
     syncPrediction: OnlineScene.prototype.syncPrediction,
     drawView: OnlineScene.prototype.drawView,
+    drawActors: OnlineScene.prototype.drawActors,
     interpolateView: OnlineScene.prototype.interpolateView,
     drawSelfPose: OnlineScene.prototype.drawSelfPose,
     drawNpcs() {},
@@ -531,9 +532,10 @@ test("prediction covers network delay within a bounded history horizon", () => {
   expect(sent[0].targetTick).toBeGreaterThan(
     observation.serverTick + PROTOCOL.INPUT_LEAD_TICKS,
   );
-  expect(sent.at(-1).targetTick).toBeLessThanOrEqual(
+  expect(sent.at(-1).targetTick).toBeGreaterThan(
     observation.serverTick + inputHorizonTicks(clock),
   );
+  expect(prediction.count).toBeLessThan(PROTOCOL.INPUT_HISTORY);
   // The same sample reports the bounded motion state it extends, for the server's
   // adoption check; the values are asserted by the divert-alignment suite.
   expect(Object.keys(sent[0].motion).sort()).toEqual(["vx", "vy", "x", "y"]);

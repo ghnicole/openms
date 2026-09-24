@@ -56,6 +56,22 @@ export class GameplayGateway {
     };
   }
 
+  /** Unique connected characters across all fields; grace-period actors are offline. */
+  onlinePlayerCount() {
+    let count = 0;
+    // Character admission bounds this map by the world's actor capacity.
+    for (const actor of this.characters.values()) {
+      if (
+        actor.connection &&
+        !actor.connection.data.closed &&
+        !actor.retiring
+      ) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   upgrade(request, server, address) {
     this.auth.origin(request);
     const session = this.auth.session(request);
@@ -351,6 +367,7 @@ export class GameplayGateway {
     if (
       !data.ready &&
       (message.type === "input" ||
+        message.type === "combat.hits" ||
         (message.type === "command" && !data.transfer))
     ) {
       throw protocolError("NOT_ALLOWED");
@@ -361,6 +378,8 @@ export class GameplayGateway {
     switch (message.type) {
       case "input":
         return this.input(socket, message);
+      case "combat.hits":
+        return this.world.recordHits(socket.data.actor, message);
       case "command":
         return this.command(socket, message);
       case "ready":

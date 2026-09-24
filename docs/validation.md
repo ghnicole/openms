@@ -8,6 +8,7 @@ Read a result together with its **source/catalog identity, fixture, action and l
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | Online 100% movement                   | [Movement parity](movement-parity.md#scoped-verification)                                                            | Shared-kernel/server steps, browser prediction and checkpoint continuation.                             |
 | Slow-network gameplay                 | [Latency repair](#slow-network-gameplay-repair) | 500 ms RTT, delayed map assets, native walking/dialogue/travel and reconnect. |
+| Optimistic client and queued actions | [Queue and authority checks](#optimistic-client-and-queued-actions) | Immediate combat, two queued casts and inventory moves at 500 ms RTT, authoritative settlement and reconnect. |
 | Watchdog false kicks and stuck leases | [Contact and retirement repair](#watchdog-contact-and-retirement-repair) | Real map 10000 physics across a delivery gap; kicked-character cleanup. |
 | Startup asset preload                 | [Startup cache](#startup-asset-preload) | Cold/warm startup, map entry, cache residency and walking at 500 ms RTT. |
 | Browser cache capacity                | [Cache capacity and index](#browser-cache-capacity-and-index) | Quota-aware disk limits, retained metadata, interruption recovery and startup regression. |
@@ -32,6 +33,20 @@ Read a result together with its **source/catalog identity, fixture, action and l
 | Documentation                          | [Maintenance and checks](documentation-guide.md)                                                                     | Source links/routes, current constants, readable navigation and rendered diagrams.                     |
 
 Reports above retain the build they actually measured. A later source edit does not retroactively refresh their results.
+
+## Optimistic client and queued actions
+
+On **2026-09-24**, `bun server/tools/check-combat-latency.js --scope combat --output /tmp/openms-optimistic-accepted` passed using isolated fighter/mage accounts and retained extracted assets. With **500 ms simulated RTT** and **1.2–1.5 second traffic holds**, native basic-attack, warrior-skill and mage-skill input produced local feedback in **25.1, 8.3 and 16.4 ms**, respectively. Each action confirmed without restarting its local animation; the mage projectile preview also matched its authoritative echo. These are three observed samples, not a p95 or general WAN performance claim.
+
+Two native casts started before confirmation and reserved MP from **996 to 988**; authoritative publication and reconnect both restored **988**. Two native whole-stack moves previewed slots **1 → 2 → 3** while the confirmed inventory still held slot 1, then settled at slot 3 with the same item UID and quantity **10**, including after reconnect. This checks the private owner update and recovery, not a second player's view or trade/pickup contention. No browser errors were recorded. Remote monsters continued moving during the separate 450 ms observation hold, within the renderer's elapsed-time movement budget.
+
+Focused checks passed **122 tests / 977 assertions across 14 files**, including forged damage/position reports, ordinary checkpoint replay, silent impulse reconstruction, socket backpressure, immutable retries, queued cast release ordering, unknown receipts, resource reservations, last-ammunition presentation and rejected inventory dependencies. The guarded online build covered **975 modules**; scoped formatting, lint and whitespace checks passed. Documentation checking retained **881 pre-existing failures**, with no added failures. The browser acceptance check now compares monster displacement with actual frame time; its former fixed 20-pixel threshold could reject a legal 20.04-pixel step at a 16.7 ms frame interval.
+
+Measured fixture stages: database/content **328 ms**, seed **176 ms**, backend startup **1,222 ms**, frontend startup **1,985 ms**, browser acquisition **503 ms**, fixture teardown **131 ms**. Scenario stages: identity **1,451 ms**, fighter login/readiness **19,921 ms**, basic attack **2,532 ms**, warrior skill **2,531 ms**, queued casts **6,571 ms**, monsters **1,019 ms**, mage login/readiness **19,993 ms**, mage skill **2,535 ms**, context teardown **85 ms**. These stages include deliberate delays; no extraction or concurrency comparison ran.
+
+The measured tree used source fingerprint `9133fec28f3ab8828b5b49077887d1d97b83947fc358e1adcb701e0099ef08a8`, source build `d697f1be58d11292b531ce5218212b4773048f0e397cac5b32e8b8c4cee30af4`, rules `ca2ce943f6a264a98f63f3b06c6ef20f8e5fdc33a76f0ced550568f8d16a8ea0`, catalog `bf4d12c856304ed77c55a1296dcd7bf82d11f2bea505e111c517ae1b1e482af4`, and asset build `11be20f84c507b5d85eba2fbdbd91f06c6b591922b11bad32ad0d02d3a16a939`. Raw reports, traces and logs remain outside the repository.
+
+See the [implemented scope and research](optimistic-client.md#implemented-subset). Server motion and damage remain authoritative; prediction and action queues are bounded. Long upstream stalls can still cause corrections or expired actions, same-domain command throughput remains receipt-bound, and historical movement/world rollback is not implemented. Restart the client and server together to use the matching rules identity. This scoped acceptance run does not establish every skill, gameplay domain, outage duration or production security property.
 
 ## Portal feedback and regional caching
 

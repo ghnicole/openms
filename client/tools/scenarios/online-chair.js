@@ -1,8 +1,13 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { assertion, failureDetails } from "../native-evidence.js";
+import { assertion, failureDetails, measureStage } from "../native-evidence.js";
 import { onlineIdentity } from "./online-lifecycle.js";
-import { participant, ready } from "./online-ui-repairs.js";
+import {
+  participant,
+  ready,
+  consoleSection,
+  closeConsole,
+} from "./online-ui-repairs.js";
 import { login } from "./online-recycling-scrolls.js";
 import { clickLabel } from "./native.js";
 
@@ -14,6 +19,7 @@ export async function runChair({ browser, url, output }) {
   await mkdir(output, { recursive: true });
   const report = {
     status: "running",
+    timings: {},
     checks: [],
     results: [],
     errors: [],
@@ -24,11 +30,19 @@ export async function runChair({ browser, url, output }) {
     report.identity = await onlineIdentity(url);
     for (const name of ["sitter", "witness"]) {
       const page = await participant(browser, contexts, pages, report);
-      await login(page, url, name);
+      await measureStage(report.timings, `${name}-login`, () =>
+        login(page, url, name),
+      );
     }
     const [sitter, witness] = pages;
     await sitOnChair(sitter, output, report);
     await witnessSeesSeat(sitter, witness, report);
+    await measureStage(report.timings, "seated-mp-recovery", () =>
+      seatedRecovery(sitter, report),
+    );
+    await measureStage(report.timings, "player-count", () =>
+      playerCount(sitter, witness, output, report),
+    );
     report.status = "pass";
   } catch (error) {
     report.status = "fail";
@@ -44,6 +58,83 @@ export async function runChair({ browser, url, output }) {
     );
   }
   return report;
+}
+
+/** MP keeps recovering while seated even when no HP can be restored. */
+async function seatedRecovery(page, report) {
+  const before = await page.evaluate(() => window.maple.snapshot().profile);
+  assertion(before.hp === before.maxHP, "Recovery fixture must have full HP");
+  assertion(before.mp < before.maxMP, "Recovery fixture must be missing MP");
+  await page.waitForFunction(
+    (mp) => {
+      const state = window.maple.snapshot();
+      return state.simulation.seat !== null && state.profile.mp >= mp + 3;
+    },
+    { timeout: 15000 },
+    before.mp,
+  );
+  const after = await page.evaluate(() => window.maple.snapshot().profile);
+  assertion(after.hp === before.hp, "Seated recovery changed full HP");
+  report.recovery = { beforeMP: before.mp, afterMP: after.mp, hp: after.hp };
+  report.checks.push("Seated MP recovers with full HP");
+  const epoch = await page.evaluate(
+    () => window.mapleOnline.snapshot().connectionEpoch,
+  );
+  await consoleSection(page, "diagnostics");
+  await clickLabel(page, "Reconnect session", "#state-testing-controls");
+  await page.waitForFunction(
+    (previous) => window.mapleOnline.snapshot().connectionEpoch !== previous,
+    {},
+    epoch,
+  );
+  await ready(page);
+  await closeConsole(page);
+  const resumed = await page.evaluate(() => window.maple.snapshot().profile.mp);
+  assertion(resumed >= after.mp, "Recovered MP was lost on reconnect");
+  report.checks.push("Recovered MP survives a native reconnect");
+}
+
+async function waitForPlayerCount(page, count) {
+  await page.waitForFunction(
+    (expected) =>
+      document.querySelector("#project-players")?.textContent ===
+      `Players online: ${expected}`,
+    { timeout: 15000 },
+    count,
+  );
+}
+
+/** The public count and shell layout follow actual connections, independent of the field view. */
+async function playerCount(sitter, witness, output, report) {
+  await waitForPlayerCount(sitter, 2);
+  await waitForPlayerCount(witness, 2);
+  for (const size of [
+    { width: 1280, height: 800 },
+    { width: 800, height: 600 },
+  ]) {
+    await sitter.setViewport(size);
+    const fits = await sitter.evaluate(() => {
+      const nodes = document.querySelectorAll("#project-bar > *");
+      let right = 0;
+      for (const node of nodes) {
+        if (node.hidden) continue;
+        const rect = node.getBoundingClientRect();
+        if (rect.left < right || rect.right > innerWidth) return false;
+        right = rect.right;
+      }
+      return true;
+    });
+    assertion(fits, "Project bar controls overlap or overflow");
+    await sitter.screenshot({
+      path: join(output, `project-bar-${size.width}.png`),
+      clip: { x: 0, y: 0, width: size.width, height: 27 },
+    });
+  }
+  await witness.goto("about:blank");
+  await waitForPlayerCount(sitter, 1);
+  report.checks.push(
+    "Player count updates from two connections to one at 800×600",
+  );
 }
 
 function seated(page) {
@@ -84,18 +175,7 @@ async function sitOnChair(page, output, report) {
         ),
     { timeout: 5000 },
   );
-  const state = await page.evaluate(() => {
-    const entity = window.mapleOnline
-      .observation()
-      .entities.find((entry) => entry.appearance?.name === "Sitter");
-    return {
-      status: window.maple.snapshot().online.status,
-      seat: window.maple.snapshot().simulation?.seat ?? null,
-      action: window.maple.snapshot().simulation?.action ?? null,
-      entity,
-      chairs: window.maple.snapshot().chairs ?? null,
-    };
-  });
+  const state = await chairState(page);
   await page.screenshot({ path: join(output, "seated.png") });
   report.seated = state;
   assertion(
@@ -123,6 +203,22 @@ async function sitOnChair(page, output, report) {
     "Seeded chair sits through the native setup tab without a reconnect",
   );
   await ready(page);
+}
+
+function chairState(page) {
+  return page.evaluate(() => {
+    const entity = window.mapleOnline
+      .observation()
+      .entities.find((entry) => entry.appearance?.name === "Sitter");
+    const state = window.maple.snapshot();
+    return {
+      status: state.online.status,
+      seat: state.simulation?.seat ?? null,
+      action: state.simulation?.action ?? null,
+      entity,
+      chairs: state.chairs ?? null,
+    };
+  });
 }
 
 /** Native double click: the first down arms the carried instance, the second down (detail 2)

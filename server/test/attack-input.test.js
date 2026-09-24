@@ -35,3 +35,18 @@ test("future, ancient, overloaded and expired attack edges have explicit bounds"
   a.field.tick = 1000;
   expect(takeAttackInput(a)).toBe(false);
 });
+
+test("queued attacks survive an active animation but their age never resets", () => {
+  const a = actor();
+  retainAttackInput(a, sample(true, 1, 99));
+  retainAttackInput(a, sample(false, 2, 100));
+  retainAttackInput(a, sample(true, 3, 101));
+  a.field.tick = 110;
+  expect(takeAttackInput(a, false)).toBe(false);
+  expect(a.attackEdges).toHaveLength(2);
+  expect(takeAttackInput(a, true)).toBe(true);
+  expect(a.combatInputSeq).toBe(1);
+  a.field.tick = 169;
+  expect(takeAttackInput(a, true)).toBe(false);
+  expect(a.attackEdges).toHaveLength(0);
+});

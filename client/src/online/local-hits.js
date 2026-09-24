@@ -46,7 +46,8 @@ export class LocalHits {
     this.timers = new Set();
   }
 
-  /** Schedule the release-frame feedback for one locally admitted action. */
+  /** Roll provisional lines on the input edge, as in the original chain (`009581a9`).
+   *  Presentation waits for release; reports are telemetry, never authoritative damage. */
   begin(record) {
     if (record.rejected || record.hitScheduled) return;
     const rectangle = attackRectangle(
@@ -62,8 +63,9 @@ export class LocalHits {
     record.hits = this;
     record.hitRectangle = rectangle ?? null;
     record.hitRay = ray;
+    this.resolve(record);
     record.hitTimer = this.schedule(record, record.release, () =>
-      this.resolve(record),
+      this.presentResolved(record),
     );
   }
 
@@ -88,9 +90,8 @@ export class LocalHits {
     return timer;
   }
 
-  /** Resolve one attack against the mob poses the player is actually seeing. */
+  /** Roll one attack against the mob poses the player is seeing, at the input edge. */
   resolve(record) {
-    record.hitTimer = null;
     if (record.rejected || !record.hits) return;
     const scene = this.combat.scene;
     const origin = this.stage?.presentation;
@@ -98,14 +99,63 @@ export class LocalHits {
     if (!scene || !origin || !stats) return;
     record.hitFacing = origin.facing > 0 ? 1 : -1;
     const count = this.select(record, origin);
+    const resolved = [];
+    const hits = [];
     for (let index = 0; index < count; index++) {
       const view = this.targets[index];
       this.targets[index] = null;
-      // 00953fca: the number and the reaction wait for the ball, not for the release frame.
+      const rolls = this.roll(record, view, stats);
+      if (!rolls) continue;
+      resolved.push({ view, rolls });
+      for (let line = 0; line < rolls.length; line++) {
+        hits.push({
+          targetId: view.entity.id,
+          line,
+          damage: rolls[line].amount,
+          critical: rolls[line].critical,
+        });
+      }
+    }
+    record.resolved = resolved;
+    this.report(record, hits);
+  }
+
+  /** Publish the rolled lines once; the authority key is the attack's own identity. */
+  report(record, hits) {
+    if (!hits.length) return;
+    const feedbackId = record.skillId ? String(record.identity) : null;
+    const inputSeq = record.skillId ? null : Number(record.identity);
+    if (feedbackId === null && !Number.isSafeInteger(inputSeq)) return;
+    this.combat.owner.reportHits?.({
+      feedbackId,
+      inputSeq,
+      skillId: Number(record.skillId) || 0,
+      hits,
+    });
+  }
+
+  /** Draw the lines already rolled at the input edge, after the authored release/flight. */
+  presentResolved(record) {
+    if (record.rejected) return;
+    const origin = this.stage?.presentation;
+    for (const entry of record.resolved ?? []) {
+      const view = entry.view;
       const delay = record.hitRay
-        ? flightMs(origin, view, record.projectile)
+        ? origin
+          ? flightMs(origin, view, record.projectile)
+          : 0
         : 0;
-      this.roll(record, view, stats, delay);
+      for (let line = 0; line < entry.rolls.length; line++) {
+        this.remember(view, entry.rolls[line].amount, delay, {
+          record,
+          line,
+        });
+      }
+      if (delay > 0) {
+        this.schedule(record, delay, () =>
+          this.present(record, view, entry.rolls),
+        );
+      } else this.present(record, view, entry.rolls);
     }
   }
 
@@ -171,9 +221,9 @@ export class LocalHits {
     return slot;
   }
 
-  roll(record, view, stats, delay) {
+  roll(record, view, stats) {
     const info = view.life?.info;
-    if (!info) return;
+    if (!info) return null;
     const lines = this.lines(record);
     const rolls = [];
     for (let line = 0; line < lines; line++) {
@@ -186,19 +236,12 @@ export class LocalHits {
           record.use,
         );
       } catch {
-        return;
+        return null;
       }
-      if (!Number.isSafeInteger(amount) || amount < 0) return;
+      if (!Number.isSafeInteger(amount) || amount < 0) return null;
       rolls.push({ amount, critical: this.damage.lastCritical });
     }
-    for (let line = 0; line < rolls.length; line++) {
-      this.remember(view, rolls[line].amount, delay, { record, line });
-    }
-    if (delay > 0) {
-      this.schedule(record, delay, () => this.present(record, view, rolls));
-      return;
-    }
-    this.present(record, view, rolls);
+    return rolls;
   }
 
   lines(record) {
@@ -440,6 +483,7 @@ export class LocalHits {
 
   cancel(record) {
     record.hits = null;
+    record.resolved = null;
     for (const [id, queue] of this.pending) {
       for (let i = queue.length - 1; i >= 0; i--) {
         if (queue[i].record === record) queue.splice(i, 1);

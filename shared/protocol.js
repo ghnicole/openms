@@ -97,15 +97,13 @@ export {
 /** Plausibility envelope for the motion a client reports for its own actor. Browser
  *  trust policy, not a recovered original constant.
  *
- *  The authority deliberately does **not** correct a client's position or velocity: it
- *  adopts the report so the client's own trajectory is the source of truth and movement
- *  is never rubber-banded. This envelope is only a watchdog for motion the kernel cannot
- *  explain from the inputs the server consumed. Isolated deviations are adopted;
- *  the server watchdog accumulates repeated incidents before closing a session.
+ *  Server input simulation owns position and velocity. Every checkpoint rebases client
+ *  prediction. This envelope supplies optional watchdog evidence; being inside it
+ *  never authorizes a reported position or grants extra movement time.
  *
  *  Sizing (`speedPxPerSecond` 900 = the fastest combination the kernel can author —
  *  terminal fall 670 px/s, plus a horizontal movement skill 350 px/s, hypot 756 — with
- *  headroom): a report is judged against the time since the last adopted report, so the
+ *  headroom): a report is judged against the time since the last inspected report, so the
  *  same rule covers one tick of jitter and a reconnect gap where the player kept moving.
  *  An additional 500 ms allowance tolerates delayed input/event observations, even
  *  when consecutive client reports are only one simulation tick apart.
@@ -113,10 +111,10 @@ export {
  *  terminal fall is 20.1 px and one authoritative knockback adds 8.1 px.
  *  `velocityPxPerSecond` 700 is an instantaneous bound, so it does not scale.
  *
- *  Adoption is refused only where the server owns a rule the client cannot know (a
+ *  Reports are not compared where the server owns a rule the client cannot know (a
  *  pending field transition, death, a map seat, a ladder attach, or an unpredicted
- *  movement skill). Those checkpoints carry `authoritative: true`; ordinary checkpoints
- *  are observations and never reposition the browser. */
+ *  movement skill). Those checkpoints carry the legacy `authoritative: true` marker;
+ *  ordinary checkpoints are equally trusted for prediction reconciliation. */
 export const MOTION_PLAUSIBILITY = Object.freeze({
   latencyAllowanceMs: 500,
   speedPxPerSecond: 900,
@@ -125,7 +123,7 @@ export const MOTION_PLAUSIBILITY = Object.freeze({
 });
 
 /** Largest gap-scaled displacement allowed for a report spanning `elapsedMs`,
- *  measured from the last adopted report; never below one quantum of headroom. */
+ *  measured from the last inspected report; never below one quantum of headroom. */
 export function plausiblePositionPx(elapsedMs) {
   const scaled = Number.isFinite(elapsedMs)
     ? (MOTION_PLAUSIBILITY.speedPxPerSecond *
@@ -357,9 +355,8 @@ const clientSchema = union("type", {
       record({
         playSession: id,
         lastEventSeq: revision,
-        // Locally presented motion at reconnect. A resumed client that kept moving
-        // (or was frozen ahead of the server) is the source of truth for its own
-        // position, so the server adopts this instead of snapping the player back.
+        // Locally presented motion at reconnect is diagnostic only. Resume restores
+        // trusted server state even if the client continued moving during the gap.
         motion: optional(reportedMotion),
       }),
     ),
@@ -373,8 +370,25 @@ const clientSchema = union("type", {
     jump: boolean,
     attack: boolean,
     // State the sample extends, at the end of targetTick - 1. `neutral` heartbeats
-    // carry no prediction and omit it, so the server adopts only real predictions.
+    // carry no prediction and omit this optional diagnostic report.
     motion: optional(reportedMotion),
+  }),
+  // Provisional outgoing digits follow the original input-edge roll (`009581a9`/`0066b05e`).
+  // Reports are bounded telemetry. Server-generated damage and critical rolls remain final.
+  "combat.hits": clientRecord("combat.hits", {
+    fieldEpoch: id,
+    feedbackId: nullable(id),
+    inputSeq: nullable(u32),
+    skillId: u32,
+    hits: array(
+      record({
+        targetId: id,
+        line: number(0, 120),
+        damage: number(0, COMBAT_VALUE_LIMIT),
+        critical: boolean,
+      }),
+      32,
+    ),
   }),
   command: clientRecord("command", {
     fieldEpoch: id,

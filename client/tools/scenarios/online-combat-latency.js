@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { assertion, failureDetails, measureStage } from "../native-evidence.js";
 import { onlineIdentity } from "./online-lifecycle.js";
 import { participant, focusGame, ready } from "./online-ui-repairs.js";
+import { clickLabel } from "./native.js";
+import { reconnect } from "./online-latency.js";
 import { login } from "./online-recycling-scrolls.js";
 
 const EMPTY_RECORD = Object.freeze({});
@@ -81,7 +83,8 @@ function movement(rows) {
   let lateMoving = 0;
   let stalls = 0,
     moving = 0,
-    maximumStep = 0;
+    maximumStep = 0,
+    maximumRateExcess = 0;
   for (let i = 1; i < rows.length; i++) {
     for (const actor of rows[i].actors.filter(
       (entry) => entry.kind === "mob",
@@ -92,13 +95,16 @@ function movement(rows) {
       if (!previous) continue;
       const distance = Math.hypot(actor.x - previous.x, actor.y - previous.y);
       maximumStep = Math.max(maximumStep, distance);
+      const elapsed = Math.min(100, rows[i].time - rows[i - 1].time);
+      // RemoteMotion permits 1.2 px/ms. Frame scheduling need not be exactly 60 Hz.
+      maximumRateExcess = Math.max(maximumRateExcess, distance - 1.2 * elapsed);
       const age = observationAge(observed, actor, rows[i].time);
       if (age > 150 && distance > 0.001) lateMoving++;
       if (distance > 0.001) moving++;
       else stalls++;
     }
   }
-  return { stalls, moving, maximumStep, lateMoving };
+  return { stalls, moving, maximumStep, maximumRateExcess, lateMoving };
 }
 
 export async function runCombatLatency({
@@ -135,8 +141,8 @@ export async function runCombatLatency({
       monsters(page, network),
     );
     report.movement = movement(rows);
-    verifyMovement(report);
     await Bun.write(join(output, "monster-frames.json"), JSON.stringify(rows));
+    verifyMovement(report);
     await ready(page);
     if (!baseline) {
       const mage = await participant(browser, contexts, pages, report);
@@ -212,6 +218,9 @@ async function attacks(
       }
     }
   }
+  if (!report.baseline && character === "fighter") {
+    await queuedActions(page, network, report);
+  }
 }
 
 function actionSummary(rows, start) {
@@ -263,7 +272,7 @@ function verifyMovement(report) {
     report.movement,
   );
   assertion(
-    report.movement.maximumStep < 20,
+    report.movement.maximumRateExcess <= 2,
     "A mob snapped during ordinary delayed motion",
     report.movement,
   );
@@ -275,4 +284,163 @@ async function verifySource(url, report) {
     (await onlineIdentity(url)).sourceBuildId === report.identity.sourceBuildId,
     "Source changed during check",
   );
+}
+
+/** Real key edges: the next cast and both cost previews precede delayed confirmation. */
+async function queuedCasts(page, network) {
+  await focusGame(page);
+  const before = await page.evaluate(() => ({
+    mp: window.maple.snapshot().profile.mp,
+    ids: window.maple
+      .snapshot()
+      .localCombat.records.map((record) => record.identity),
+  }));
+  network.stall(1500);
+  await page.keyboard.press("d", { delay: 30 });
+  await page.waitForFunction(
+    () => {
+      const local = window.maple.snapshot().localCombat;
+      const current = local.records.find(
+        (record) => record.identity === local.active,
+      );
+      return current && current.duration - current.age < 180;
+    },
+    { polling: "raf", timeout: 3000 },
+  );
+  await page.keyboard.press("d", { delay: 30 });
+  await page.waitForFunction(
+    (ids) =>
+      window.maple
+        .snapshot()
+        .localCombat.records.filter((record) => !ids.includes(record.identity))
+        .length >= 2,
+    { polling: "raf", timeout: 2000 },
+    before.ids,
+  );
+  const preview = await page.evaluate(() => ({
+    mp: window.maple.snapshot().profile.mp,
+    records: window.maple.snapshot().localCombat.records.slice(-2),
+  }));
+  assertion(preview.mp < before.mp, "Queued casts did not reserve MP", {
+    before,
+    preview,
+  });
+  assertion(
+    preview.records.every((record) => !record.confirmed),
+    "Preview waited for a reply",
+    preview,
+  );
+  return {
+    beforeMP: before.mp,
+    previewMP: preview.mp,
+    count: 2,
+    ...(await confirmQueuedCasts(
+      page,
+      preview.records.map((record) => record.identity),
+    )),
+  };
+}
+
+async function confirmQueuedCasts(page, ids) {
+  await page.waitForFunction(
+    (ids) => {
+      const state = window.maple.snapshot();
+      return ids.every((id) =>
+        state.localCombat.records.some(
+          (record) =>
+            record.identity === id && record.confirmed && !record.rejected,
+        ),
+      );
+    },
+    { timeout: 12000 },
+    ids,
+  );
+  await pause(1000);
+  const confirmedMP = await page.evaluate(
+    () => window.maple.snapshot().profile.mp,
+  );
+  await reconnect(page);
+  const restoredMP = await page.evaluate(
+    () => window.maple.snapshot().profile.mp,
+  );
+  assertion(
+    restoredMP === confirmedMP,
+    "Reconnect changed committed cast costs",
+    { confirmedMP, restoredMP },
+  );
+  return { confirmedMP, restoredMP };
+}
+
+async function queuedInventory(page, network) {
+  const panel = '.maple-ui-panel[aria-label="Item"]';
+  await focusGame(page);
+  await page.keyboard.press("i");
+  await page.waitForSelector(panel, { visible: true });
+  await clickLabel(page, "Item tab 2", panel);
+  const uid = await page.evaluate(
+    () =>
+      window.maple
+        .snapshot()
+        .profile.inventory.find((item) => item.id === 2000000).uid,
+  );
+  network.stall(1500);
+  for (const slot of [2, 3]) {
+    const source = `${panel} [data-item-id="2000000"][data-item-slot="${slot - 1}"]`;
+    await page.waitForSelector(source, {
+      visible: true,
+    });
+    await page.click(source);
+    await page.click(`${panel} [data-item-slot="${slot}"]`);
+    await page.waitForFunction(
+      (expected) =>
+        window.maple
+          .snapshot()
+          .profile.inventory.find((item) => item.id === 2000000)?.slot ===
+        expected,
+      { timeout: 1000 },
+      slot,
+    );
+  }
+  const observedSlot = await page.evaluate(
+    () =>
+      window.mapleOnline
+        .observation()
+        .presentation.profile.inventory.find((item) => item.id === 2000000)
+        .slot,
+  );
+  assertion(observedSlot === 1, "Inventory preview waited for confirmation", {
+    observedSlot,
+  });
+  await page.waitForFunction(
+    () =>
+      window.mapleOnline
+        .observation()
+        .presentation.profile.inventory.find((item) => item.id === 2000000)
+        ?.slot === 3,
+    { timeout: 12000 },
+  );
+  return confirmInventory(page, uid);
+}
+
+async function confirmInventory(page, uid) {
+  await page.keyboard.press("i");
+  await reconnect(page);
+  const restored = await page.evaluate(
+    (id) =>
+      window.maple.snapshot().profile.inventory.find((item) => item.uid === id),
+    uid,
+  );
+  assertion(
+    restored.slot === 3 && restored.count === 10,
+    "Queued inventory moves changed identity, count or final slot",
+    restored,
+  );
+  return { slot: restored.slot, quantity: restored.count, sameIdentity: true };
+}
+
+async function queuedActions(page, network, report) {
+  report.queue = await measureStage(report.timings, "queued-casts", () =>
+    queuedCasts(page, network),
+  );
+  report.inventoryQueue = await queuedInventory(page, network);
 }

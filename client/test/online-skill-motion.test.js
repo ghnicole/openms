@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { NativeProfileSource } from "../src/online/native-source.js";
 import { OnlineUI } from "../src/online/ui.js";
 import { OnlinePrediction } from "../src/online/prediction.js";
 import { skillImpulseFor } from "../src/online/optimistic-skill.js";
@@ -49,12 +50,17 @@ function fixture() {
     resolve = done;
   });
   const ui = Object.assign(Object.create(OnlineUI.prototype), {
-    store: { profile },
+    state: {
+      presentation: { profile, stats: {} },
+      revisions: { character: 0, inventory: 0 },
+    },
+    ui: { status: fail },
     catalog,
     hooks: { scene: () => ({ scene }), prediction },
     blocked: () => false,
     command: () => response,
   });
+  ui.store = new NativeProfileSource(ui);
   return {
     simulation,
     prediction,
@@ -150,3 +156,7 @@ test("a landing during a paused skill clock still permits Flash Jump on the next
   controller.impulse(4111006, {}, 20);
   expect(controller.impulseError(4111006)).not.toBeNull();
 });
+
+function fail(message) {
+  throw new Error(message);
+}

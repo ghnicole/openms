@@ -102,7 +102,7 @@ Configure `.env.server`:
 
 Compose defaults are `POSTGRES_USER=openms`, `POSTGRES_PASSWORD=openms_local_only`, `POSTGRES_DB=openms`, `POSTGRES_PORT=55432`. Export overrides or pass a private `--env-file` to Compose, then supply a matching `DATABASE_URL` to Bun. Compose and Bun do not load each other's scoped files.
 
-The motion watchdog is temporarily disabled by default in development and production. Set `OPENMS_MOTION_WATCHDOG_ENABLED=true` in `.env.server` to restore its lag-tolerant enforcement, or `false` to disable it. Disabled mode skips discrepancy evidence and kicks for both ordinary movement reports and reconnect reports. Finite motion validation, input ordering and server-owned position rules still apply. Restart the backend after changing the setting; its startup line reports `motion watchdog enabled` or `disabled`. This setting needs no extraction or asset rebuild.
+The motion watchdog is temporarily disabled by default in development and production. Set `OPENMS_MOTION_WATCHDOG_ENABLED=true` in `.env.server` to restore its lag-tolerant enforcement, or `false` to disable it. Disabled mode skips discrepancy evidence and kicks for both ordinary movement reports and reconnect reports. Finite motion validation, input ordering and independent server movement simulation always apply. Client position reports remain diagnostic hints in either mode; checkpoints correct local prediction. Restart the backend after changing the setting; its startup line reports `motion watchdog enabled` or `disabled`. This setting needs no extraction or asset rebuild.
 
 #### Network
 
@@ -242,7 +242,7 @@ Wait for **`online client ready`**, then open **http://127.0.0.1:3102**.
 
 The frontend builds its browser code, serves generated assets, and proxies same-origin `/api/` HTTP and WebSocket requests to port 3200. Backend startup and frontend startup reuse the [extracted assets](index.md). The browser does not connect to PostgreSQL.
 
-A 27px Windows 95 project bar appears above the game in both development and production. Its left edge shows the live server round-trip time behind a green, orange or red quality dot. X and GitHub open `x.com/tensorfish` and the repository in separate tabs; Docs opens `docs.openms.dev`. Bug Report opens an email to `tensorfish@proton.me`; About opens a Windows 95 dialog with a short game summary and an as-is, use-at-your-own-risk disclaimer, closed by its OK button, its close box or Escape.
+A 27px Windows 95 project bar appears above the game in both development and production. Its left edge shows the live server round-trip time behind a green, orange or red quality dot. Players online shows connected characters across all maps, including before login; it refreshes every 10 seconds and shows a dash when the count is unavailable. Disconnected characters retained for reconnect are excluded. X and GitHub open `x.com/tensorfish` and the repository in separate tabs; Docs opens `docs.openms.dev`. Bug Report opens an email to `tensorfish@proton.me`; About opens a Windows 95 dialog with a short game summary and an as-is, use-at-your-own-risk disclaimer, closed by its OK button, its close box or Escape.
 
 #### Login
 

@@ -705,16 +705,19 @@ export class SkillAttack {
     }
   }
 
-  reserveShot(record, target, origin) {
-    let shot = null;
+  /** Claim one inactive entry from the bounded impact pool. */
+  acquireShot() {
     for (const candidate of this.shots) {
       if (!candidate.active) {
-        shot = candidate;
-        break;
+        candidate.active = true;
+        return candidate;
       }
     }
-    if (!shot) throw new Error("Admitted skill impact pool exhausted");
-    shot.active = true;
+    throw new Error("Admitted skill impact pool exhausted");
+  }
+
+  reserveShot(record, target, origin) {
+    const shot = this.acquireShot();
     shot.dotDamage = 0;
     shot.venomDamage = 0;
     shot.venomId = 0;
@@ -734,6 +737,8 @@ export class SkillAttack {
     shot.onHit = record.spec ? this.onHit : this.field.hooks.onSkillHit;
     shot.hit.skillId = record.skill.id;
     shot.hit.knockbackChance = 0;
+    // Tie optional client telemetry to this exact attack.
+    shot.hit.reportId = shot.feedbackId ?? shot.inputSeq ?? null;
     shot.projectileId = this.use.projectileId;
     shot.startX =
       origin.x +

@@ -78,6 +78,11 @@ body {
 #project-ping[data-quality="unknown"] {
   color: #6b6b6b;
 }
+#project-players {
+  padding: 0 8px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
 #project-bar a:hover,
 #project-bar button:hover {
   border-color: #dfdfdf #808080 #808080 #dfdfdf;

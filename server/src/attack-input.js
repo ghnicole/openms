@@ -7,6 +7,8 @@ export function resetAttackInput(actor) {
   actor.attackEdges = [];
   actor.receivedAttack = false;
   actor.combatInputSeq = null;
+  // Retire diagnostic hit reports with their attack and field lifetime.
+  actor.hitReports?.clear();
 }
 
 /** Movement samples expire by tick; a bounded attack edge still receives current-state admission. */
@@ -27,13 +29,23 @@ export function retainAttackInput(actor, sample) {
   actor.attackEdges.push({
     inputSeq: sample.inputSeq,
     tick: Math.max(tick + 1, sample.targetTick),
-    expires: tick + MAX_AGE_TICKS,
+    expires: sample.targetTick + MAX_AGE_TICKS,
   });
 }
 
 /** Consume each press once, even when its release arrived in the same network burst. */
-export function takeAttackInput(actor) {
+export function takeAttackInput(actor, ready = true) {
   actor.combatInputSeq = null;
+  for (let count = 0; count < MAX_EDGES; count++) {
+    if (
+      !actor.attackEdges[0] ||
+      actor.attackEdges[0].expires >= actor.field.tick
+    ) {
+      break;
+    }
+    actor.attackEdges.shift();
+  }
+  if (!ready) return false;
   const edge = actor.attackEdges[0];
   if (!edge || edge.tick > actor.field.tick) return false;
   actor.attackEdges.shift();

@@ -29,6 +29,9 @@ export class AuthorityCombat extends OfflineField {
         speedInfusion: 0,
         soulArrow: false,
         shadowStars: false,
+        infinity: false,
+        concentrate: 0,
+        shadowPartner: false,
       },
     };
     this.prepared = true;
@@ -51,6 +54,24 @@ export class AuthorityCombat extends OfflineField {
     facing = this.simulation.facing,
   ) {
     target.damageOwnerId = this.actor.id;
+    const line = Number.isSafeInteger(hit.line) ? hit.line : 0;
+    // Client previews are telemetry only. Even a report for a real admitted attack
+    // cannot select its damage or critical roll.
+    const reported =
+      hit.reportId === null || hit.reportId === undefined
+        ? null
+        : this.world.takeReportedDamage(this.actor, hit.reportId, target.id, {
+            skillId: hit.skillId ?? 0,
+            line,
+          });
+    if (reported) {
+      this.world.damageWatchdog?.observe(
+        this.actor.id,
+        hit.skillId ?? 0,
+        this.actor.field.tick,
+        { reported: reported.damage, reference: generated },
+      );
+    }
     super.damageTarget(target, generated, hit, facing);
   }
   get hasPendingIncoming() {
@@ -368,7 +389,7 @@ export class AuthorityCombat extends OfflineField {
     ) {
       return;
     }
-    const edge = takeAttackInput(this.actor);
+    const edge = takeAttackInput(this.actor, this.phase === "idle");
     this.wasAttack = Boolean(input.attack);
     this.phaseMs += ms;
     updateHitboxes(this.hitboxes, this.simulation, this.receiverContext);
@@ -484,5 +505,8 @@ export class AuthorityCombat extends OfflineField {
     target.speedInfusion = derived.speedInfusion ?? 0;
     target.soulArrow = Boolean(derived.soulArrow);
     target.shadowStars = Boolean(derived.shadowStars);
+    target.infinity = Boolean(derived.infinity);
+    target.concentrate = derived.concentrate ?? 0;
+    target.shadowPartner = Boolean(derived.shadowPartner);
   }
 }

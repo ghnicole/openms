@@ -654,11 +654,7 @@ export class OfflineField {
     }
     const sim = this.simulation;
     placeBody(this.attackBody, this.attack.rectangle, sim, sim.facing > 0);
-    const reactorHit = this.hooks.onStrike?.(
-      this.attackBody,
-      sim.facing,
-      this.attackSkill?.id ?? 0,
-    );
+    const reactorHit = this.hooks.onStrike?.(this.attackBody, sim.facing, 0);
     const count = this.selectAttackTargets(this.attackInfo?.mobCount ?? 1);
     if (!count) {
       this.lastStatus = reactorHit
@@ -667,6 +663,8 @@ export class OfflineField {
       return;
     }
     this.generateDamageLines(count);
+    // Match optional client telemetry to this server-resolved attack.
+    this.mobHit.reportId = this.feedbackId ?? this.feedbackInputSeq ?? null;
     for (let index = 0; index < count; index++) {
       this.mobHit.critical = !!this.damageCritical[index];
       this.damageTarget(this.attackTargets[index], this.damageLines[index]);

@@ -10,6 +10,8 @@ import {
   captureMotion,
   createHeldInput,
   assignHeldInput,
+  restoreMotion,
+  stepMotion,
 } from "../../shared/motion.js";
 import { OnlinePrediction } from "../../client/src/online/prediction.js";
 
@@ -142,7 +144,14 @@ function sampleFrame(prediction, message, field, tick) {
     prediction.interpolate(now + step, frame);
     glide.push(frame);
   }
-  return { tick, message, shown, drawn, glide };
+  return {
+    tick,
+    message,
+    shown,
+    drawn,
+    glide,
+    motion: captureMotion(prediction.simulation),
+  };
 }
 
 /** Lockstep server and client: the client predicts `lead` ticks ahead and the server
@@ -182,7 +191,7 @@ async function lockstep({ lead, ticks, hitAfter }) {
   return { ...probe, prediction, presented };
 }
 
-test("a midair mob knockback is published as a divert the client merges, not adopts", async () => {
+test("a midair mob knockback rebases prediction once and replays the exact trusted continuation", async () => {
   const hitAfter = 3;
   const divertTick = hitAfter + 1;
   const result = await lockstep({ lead: 4, ticks: 8, hitAfter });
@@ -201,17 +210,30 @@ test("a midair mob knockback is published as a divert the client merges, not ado
     expect(divert.vx).toBe(270);
     expect(divert.vy).toBe(-270);
     expect(divert.skillId).toBe(0);
-    // The client owns its trajectory: the impulse is merged once into its own current
-    // state and no authoritative checkpoint repositions it.
+    // The checkpoint contains the impulse; replay must not add it a second time.
     const frame = result.presented[divertTick - 1];
     expect(result.prediction.snapshot().diverts).toBe(1);
-    expect(result.prediction.snapshot().corrections).toBe(0);
+    expect(result.prediction.snapshot().corrections).toBe(1);
     // The drawn pose starts exactly where the player already saw it — an impulse is a
     // velocity change, never a positional correction.
     expect(
       Math.hypot(frame.drawn.x - frame.shown.x, frame.drawn.y - frame.shown.y),
     ).toBeLessThanOrEqual(0.001);
-    expect(frame.glide.at(-1)).toEqual(frame.drawn);
+    expect(frame.glide.at(-1).x).toBeCloseTo(frame.motion.x, 6);
+    expect(frame.glide.at(-1).y).toBeCloseTo(frame.motion.y, 6);
+    const reference = cloneSimulation(result.field, result.actor.simulation);
+    restoreMotion(reference, captureMotion(result.actor.simulation));
+    const held = createHeldInput();
+    for (
+      let tick = result.field.tick;
+      tick < result.prediction.predictedTick;
+      tick++
+    ) {
+      stepMotion(reference, held);
+    }
+    expect(captureMotion(result.prediction.simulation)).toEqual(
+      captureMotion(reference),
+    );
   } finally {
     dispose(result);
   }

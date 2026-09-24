@@ -188,6 +188,9 @@ export class OnlineHttp {
   }
 
   async readRoute(request, path) {
+    if (path === "/api/v1/status") {
+      return response({ onlinePlayers: this.gateway.onlinePlayerCount() });
+    }
     if (path.startsWith("/api/v1/world-content/")) {
       return worldResourceResponse(
         this.content,

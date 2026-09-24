@@ -16,6 +16,12 @@ import { NARRATIVE_ACTION_ROWS } from "../../shared/narrative-protocol.js";
 import { executeWorldAction } from "./field-world-actions.js";
 import { offerReactor } from "./field-reactors.js";
 import { releaseSkill } from "./field-skills.js";
+import {
+  awaitActionSlot,
+  retainCastIntent,
+  queueCastControl,
+  finishCastIntent,
+} from "./action-queue.js";
 
 const DOMAIN_INTERACTIONS = new Set([
   "npc.open",
@@ -26,6 +32,7 @@ const DOMAIN_INTERACTIONS = new Set([
   ...[...COMMERCE_ACTION_ROWS, ...NARRATIVE_ACTION_ROWS].map(([kind]) => kind),
 ]);
 const MAX_EPHEMERAL_RECEIPTS = 4096;
+const MAX_QUEUED_COMMANDS = 32;
 
 /** Class-1 outcomes belong to one play session, including its reconnect grace. */
 function ephemeralReceipts(actor) {
@@ -187,7 +194,9 @@ function admitSkillControl(actor, message, world, entry) {
     releaseSkill(world, actor, { ...message.action, kind: "skill.cancel" });
     reject("SERVER_BUSY", "The play-session receipt capacity is exhausted.");
   }
-  const result = releaseSkill(world, actor, message.action);
+  const result = queueCastControl(actor, message.action)
+    ? { code: "OK" }
+    : releaseSkill(world, actor, message.action);
   const receipt = {
     status: "committed",
     code: result.code,
@@ -201,7 +210,7 @@ function admitSkillControl(actor, message, world, entry) {
   return { receipt, replayed: false };
 }
 
-async function prepareAction(actor, message, world) {
+async function prepareAction(actor, message, world, queuedAt) {
   const operation = operationFor(message);
   if (["conversation", "trade", "invitation"].includes(operation.domain)) {
     operation.domainRevision = currentInteractionRevision(
@@ -243,14 +252,23 @@ async function prepareAction(actor, message, world) {
   if (physicalSkillControl(message.action)) {
     return admitSkillControl(actor, message, world, entry);
   }
+  await awaitActionSlot(world, actor, message, queuedAt);
   admitOperationSlot(actor, world, entry);
   return entry;
 }
 
 /** Preserve wire edge order, but release the admission queue before any durable debit waits. */
-function queueAdmission(actor, work) {
+function queueAdmission(actor, work, control) {
+  if (control) return work();
+  actor.queuedCommands ??= 0;
+  if (actor.queuedCommands >= MAX_QUEUED_COMMANDS) {
+    reject("SERVER_BUSY", "The action queue is full.");
+  }
+  actor.queuedCommands++;
   actor.commandAdmission ??= Promise.resolve();
-  const admission = actor.commandAdmission.then(work, work);
+  const admission = actor.commandAdmission.then(work, work).finally(() => {
+    actor.queuedCommands--;
+  });
   actor.commandAdmission = admission.then(
     () => {},
     () => {},
@@ -260,8 +278,22 @@ function queueAdmission(actor, work) {
 
 /** One authority entry: durable duplicate lookup precedes all transient domain admission. */
 export async function executeAction(actor, message, world) {
-  const entry = await queueAdmission(actor, () =>
-    prepareAction(actor, message, world),
+  const intent = retainCastIntent(actor, message);
+  let receipt;
+  try {
+    receipt = await executeQueuedAction(actor, message, world);
+    return receipt;
+  } finally {
+    finishCastIntent(actor, message.operationId, intent, receipt);
+  }
+}
+
+async function executeQueuedAction(actor, message, world) {
+  const queuedAt = performance.now();
+  const entry = await queueAdmission(
+    actor,
+    () => prepareAction(actor, message, world, queuedAt),
+    physicalSkillControl(message.action),
   );
   if (entry.receipt) {
     return world.participants.reconcile(actor, entry.receipt, entry.replayed);
