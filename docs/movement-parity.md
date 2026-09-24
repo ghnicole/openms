@@ -89,6 +89,12 @@ References: [Gambetta's client-side prediction series](https://www.gabrielgambet
 [Colyseus netcode](https://docs.colyseus.io/netcode), and Roblox's
 [server-authority write-up](https://d3fel7ao8ljmgc.cloudfront.net/fr/newsroom/2026/07/creating-responsive-cheat-resistant-games-roblox-server-authority).
 
+## Local movement correction continuity
+
+Ordinary checkpoints still restore the trusted kernel and replay its retained input suffix. Corrections preserve the **interpolated pose at receipt time**, including any correction already in progress; comparing the rendered pose with the newest full kernel position double-counted the between-tick offset and caused visible backward steps. Even sub-three-pixel differences ease instead of snapping repeatedly.
+
+The ordinary correction curve accounts for smoothstep's peak derivative and limits its added speed to **0.125 px/ms**. Its duration can exceed 600 ms after a delivery gap; it remains bounded by the 192-pixel ordinary correction limit. Explicit server relocations retain their separate 512-pixel/600 ms policy. These are presentation limits: movement validation, server checkpoints and the eight-tick input admission window are unchanged. Small RTT fluctuations preserve the filtered field clock so replaying delayed packets does not restart movement timing. See the [high-latency walking regression check](validation.md#movement-correction-regression-at-high-latency).
+
 ## Local combat presentation
 
 [LocalCombat](../client/src/online/local-combat.js) starts the character's attack pose and weapon sound on the outgoing input edge. Skill commands start their authored pose, Use cue and available projectile preview before the reply. The pose uses original avatar frame durations, weapon speed and observed speed buffs. Local action locks expire on that same clock; a delayed confirmation cannot lock movement again or replay a completed pose. Death, seats and server-owned movement transitions retain their authority.

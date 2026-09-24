@@ -14,12 +14,9 @@ import { FLASH_SKILLS } from "../skills/skill-world-rules.js";
 import { inputTargetTick } from "./input-timing.js";
 
 const STALE_OBSERVATION_MS = 5000;
-/** Reconciliation is tuned for perception, not for zero error. An error below the absorb
- *  band is invisible and is left alone; anything larger is eased in over a window that
- *  grows with the error but is capped at the character's own walk speed, so a corrected
- *  trajectory is still something the character could have travelled. Only a discontinuity
- *  the kernel cannot explain snaps. */
-const ABSORB_PX = 3;
+/** Ease even small disagreements: repeatedly snapping a few pixels is visible jitter.
+ * Ordinary correction speed is bounded; field discontinuities still snap explicitly. */
+const CORRECTION_EPSILON_PX = 0.001;
 const MIN_CORRECTION_MS = 120;
 const MAX_CORRECTION_MS = 600;
 const ORDINARY_CORRECTION_MAX_PX = 192;
@@ -111,6 +108,7 @@ export class OnlinePrediction {
     this.correctionSpan = MIN_CORRECTION_MS;
     this.drawnX = Number.NaN;
     this.drawnY = Number.NaN;
+    this.correctionPose = { x: 0, y: 0 };
     this.diverts = 0;
     this.hitPreview = null;
   }
@@ -152,6 +150,9 @@ export class OnlinePrediction {
     const wasReady = this.ready;
     const visibleX = this.simulation.x;
     const visibleY = this.simulation.y;
+    // Reconciliation can run between rendered frames. Preserve the pose at this
+    // instant, including an existing correction, rather than the previous frame.
+    this.interpolate(this.lastObservedAt, this.correctionPose);
     this.ready = true;
     this.controlFrame = message;
     this.observeJump(message.motion.groundJumpSequence);
@@ -319,20 +320,22 @@ export class OnlinePrediction {
   /** Absorb the difference between what the player currently sees and the authoritative
    *  state. The offset is re-seeded from the drawn pose rather than stacked, so a second
    *  checkpoint mid-glide retargets the same correction instead of adding another. An
-   *  error too small to see is left alone; an error beyond the band is a real
+   *  error below numeric tolerance is left alone; an error beyond the band is a real
    *  discontinuity (field replacement) and presents the new state outright. */
   seedCorrection(visibleX, visibleY, explained = false) {
+    const now = performance.now();
     const originX = Number.isFinite(this.drawnX) ? this.drawnX : visibleX;
     const originY = Number.isFinite(this.drawnY) ? this.drawnY : visibleY;
-    const dx = originX - this.simulation.x;
-    const dy = originY - this.simulation.y;
+    const base = this.interpolateKernel(now, this.correctionPose);
+    const dx = originX - base.x;
+    const dy = originY - base.y;
     const distance = Math.hypot(dx, dy);
     const limit = explained
       ? AUTHORITATIVE_CORRECTION_MAX_PX
       : ORDINARY_CORRECTION_MAX_PX;
     if (
       !Number.isFinite(distance) ||
-      distance < ABSORB_PX ||
+      distance < CORRECTION_EPSILON_PX ||
       distance > limit
     ) {
       this.clearCorrection();
@@ -340,11 +343,14 @@ export class OnlinePrediction {
     }
     this.correctionX = dx;
     this.correctionY = dy;
-    this.correctionSpan = Math.min(
-      MAX_CORRECTION_MS,
-      Math.max(MIN_CORRECTION_MS, distance / CORRECTION_PX_PER_MS),
+    // Smoothstep's peak derivative is 1.5. Bound ordinary correction speed so a
+    // recovering walk cannot reverse direction just to repay a presentation offset.
+    const span = Math.max(
+      MIN_CORRECTION_MS,
+      (1.5 * distance) / CORRECTION_PX_PER_MS,
     );
-    this.correctionUntil = performance.now() + this.correctionSpan;
+    this.correctionSpan = explained ? Math.min(MAX_CORRECTION_MS, span) : span;
+    this.correctionUntil = now + this.correctionSpan;
   }
   clearCorrection() {
     this.correctionX = 0;
@@ -353,9 +359,7 @@ export class OnlinePrediction {
     this.correctionSpan = MIN_CORRECTION_MS;
   }
 
-  /** Record how far the local report is from the authority's observation. This is
-   *  diagnostics only: an ordinary checkpoint never corrects the browser, and only a
-   *  server-owned reposition increments `corrections`. */
+  /** Compare the checkpoint with the prediction recorded for that same tick. */
   measure(message) {
     for (let index = 0; index < this.count; index++) {
       const entry = this.history[(this.head + index) % this.history.length];
@@ -510,7 +514,7 @@ export class OnlinePrediction {
    * @param {number} now Local scheduler time in milliseconds.
    * @param {{x:number,y:number}} target Reused pose scratch; never allocated per frame.
    */
-  interpolate(now, target) {
+  interpolateKernel(now, target) {
     const sim = this.hitPreview?.sourceId
       ? this.hitPreview.simulation
       : this.simulation;
@@ -522,6 +526,12 @@ export class OnlinePrediction {
     }
     target.x = sim.previousX + (sim.x - sim.previousX) * alpha;
     target.y = sim.previousY + (sim.y - sim.previousY) * alpha;
+    return target;
+  }
+
+  interpolate(now, target) {
+    if (!this.simulation) return target;
+    this.interpolateKernel(now, target);
     const remaining = this.correctionUntil - now;
     if (remaining > 0) {
       // Smoothstep removes the velocity discontinuity a linear ramp leaves at both ends,

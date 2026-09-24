@@ -1,7 +1,9 @@
 import { PROTOCOL } from "../../../shared/protocol.js";
 
 const CLOCK_SAMPLES = 9;
-const MAX_RTT_MS = 2000;
+// Two-second links need room for scheduling jitter. The 128-tick prediction ring
+// still bounds usable history independently; longer liveness probes are not clock fits.
+const MAX_RTT_MS = 3000;
 const MAX_SLEW_MS_PER_SECOND = 60;
 
 /** Fixed-size median ring; all scratch allocation precedes observation processing. */
@@ -16,6 +18,13 @@ class MedianRing {
   clear() {
     this.count = 0;
     this.next = 0;
+  }
+
+  /** Preserve filtering history when a small latency adjustment changes its origin. */
+  shift(delta) {
+    for (let index = 0; index < this.count; index++) {
+      this.values[index] += delta;
+    }
   }
 
   add(value) {
@@ -106,8 +115,12 @@ export class ServerClock {
     // Apply a newly measured network leg immediately rather than slowly slewing
     // hundreds of milliseconds behind the server after the first heartbeat.
     if (previous !== this.oneWayMs) {
-      this.tickOffsetMs += this.oneWayMs - previous;
-      this.tickOffsets.clear();
+      const delta = this.oneWayMs - previous;
+      this.tickOffsetMs += delta;
+      // A fractional change must not make the next delayed packet a fresh clock
+      // origin. Refit only when the measured leg changes by a whole simulation tick.
+      if (Math.abs(delta) > PROTOCOL.TICK_MS) this.tickOffsets.clear();
+      else this.tickOffsets.shift(delta);
     }
     return true;
   }

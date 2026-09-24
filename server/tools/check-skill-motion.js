@@ -1,16 +1,24 @@
+import { join } from "node:path";
 import { parseFlags } from "../../client/tools/source-options.js";
 import { createProfile } from "../../client/src/profile/profile-validation.js";
 import { isolatedOnlineCheck } from "./isolated-online-check.js";
 import { runSkillMotion } from "../../client/tools/scenarios/online-skill-motion.js";
+import { runWalkMotion } from "../../client/tools/scenarios/online-walk-motion.js";
+import { DelayedTraffic } from "../../client/tools/scenarios/delayed-traffic.js";
 
 /** Disposable learned Flash Jump fixture; all casts use the native keyboard. */
-async function seed(database) {
+async function seed(database, scope) {
   const account = await database.createAccount({
     name: "motion",
     passwordHash: await Bun.password.hash("password"),
     role: "player",
   });
-  const profile = createProfile({ mapId: "100000000", x: 0, y: 0, facing: 1 });
+  const profile = createProfile({
+    mapId: "100000000",
+    x: scope === "walk" ? 80 : 0,
+    y: scope === "walk" ? 274 : 0,
+    facing: 1,
+  });
   profile.name = "Motion";
   profile.job = 411;
   profile.level = 100;
@@ -28,15 +36,48 @@ if (import.meta.main) {
   const flags = parseFlags(process.argv.slice(2), {
     output: { type: "string" },
     help: { type: "boolean" },
+    scope: { type: "string" },
+    "round-trip-ms": { type: "string" },
+    baseline: { type: "boolean" },
   });
   if (flags.help) {
-    console.log("bun server/tools/check-skill-motion.js [--output DIR]");
+    console.log(
+      "bun server/tools/check-skill-motion.js [--output DIR] [--scope skills|walk] [--round-trip-ms 0..2000] [--baseline]",
+    );
   } else {
+    const scope = flags.scope ?? "skills";
+    const roundTripMs = Number(flags["round-trip-ms"] ?? 0);
+    if (!["skills", "walk"].includes(scope)) {
+      throw new Error("Unknown motion scope");
+    }
+    if (
+      !Number.isInteger(roundTripMs) ||
+      roundTripMs < 0 ||
+      roundTripMs > 2000
+    ) {
+      throw new Error("Invalid round-trip latency");
+    }
+    const timings = {};
+    const output = flags.output ?? "/tmp/openms-skill-motion";
     const report = await isolatedOnlineCheck({
-      seed,
-      run: runSkillMotion,
-      output: flags.output ?? "/tmp/openms-skill-motion",
+      seed: (database) => seed(database, scope),
+      run: (options) =>
+        scope === "walk"
+          ? runWalkMotion({
+              ...options,
+              roundTripMs,
+              baseline: Boolean(flags.baseline),
+            })
+          : runSkillMotion(options),
+      network: new DelayedTraffic(roundTripMs),
+      timings,
+      output,
     });
+    report.fixtureTimings = timings;
+    await Bun.write(
+      join(output, "report.json"),
+      JSON.stringify(report, null, 2) + "\n",
+    );
     console.log(
       JSON.stringify({
         status: report.status,

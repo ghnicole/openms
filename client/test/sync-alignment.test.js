@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, spyOn } from "bun:test";
 import { loadContent } from "../../server/src/content.js";
 import { createSimulation } from "../src/physics/simulation.js";
 import { OnlinePrediction } from "../src/online/prediction.js";
@@ -206,7 +206,7 @@ test("an optimistic movement skill is predicted immediately and rolled back when
   expect(prediction.snapshot().pendingImpulses).toBe(0);
 });
 
-test("correction bands absorb small errors, ease moderate ones, and snap a real desync", () => {
+test("small and moderate corrections ease while a real discontinuity snaps", () => {
   const { prediction, simulation } = presentable();
   const target = { x: 0, y: 0 };
   const now = performance.now();
@@ -214,12 +214,12 @@ test("correction bands absorb small errors, ease moderate ones, and snap a real 
   simulation.previousX = 100;
   prediction.interpolate(now, target);
 
-  // A disagreement below the absorb band is invisible and left alone.
+  // A small disagreement must not repeatedly snap the drawn pose by a few pixels.
   simulation.x = 102;
   simulation.previousX = 102;
   prediction.seedCorrection(100, 0);
   prediction.interpolate(now, target);
-  expect(target.x).toBeCloseTo(102, 6);
+  expect(target.x).toBeCloseTo(100, 3);
 
   // A moderate disagreement eases from the drawn pose onto the authoritative state with
   // zero added velocity at both ends, so it curves instead of nudging.
@@ -270,6 +270,57 @@ test("presentation never writes the interpolated pose back into the kernel", () 
     expect(target.x).toBeLessThanOrEqual(before.x);
   }
   expect(captureMotion(simulation)).toEqual(before);
+});
+
+test("a checkpoint correction preserves the pose between movement ticks", () => {
+  const clock = spyOn(performance, "now").mockReturnValue(1000);
+  try {
+    const { prediction, simulation } = presentable();
+    prediction.lastStepAt = 985;
+    const before = { ...prediction.interpolate(1000, {}) };
+    for (const shift of [0.63, 12]) {
+      const motion = captureMotion(simulation);
+      motion.x -= shift;
+      motion.previousX -= shift;
+      prediction.observe({
+        connectionEpoch: "epoch",
+        fieldEpoch: "field",
+        serverTick: prediction.predictedTick,
+        ackInputSeq: 1,
+        paused: false,
+        motion,
+      });
+      const after = prediction.interpolate(1000, {});
+      expect(after.x).toBeCloseTo(before.x, 6);
+      expect(after.y).toBeCloseTo(before.y, 6);
+      expect(simulation.x).toBe(motion.x);
+    }
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("ordinary correction cannot reverse a steady walk while recovering a gap", () => {
+  let now = 1000;
+  const clock = spyOn(performance, "now").mockImplementation(() => now);
+  try {
+    const { prediction, simulation } = presentable();
+    simulation.x = simulation.previousX = 100;
+    prediction.drawnX = 200;
+    prediction.drawnY = simulation.y;
+    prediction.seedCorrection(200, simulation.y);
+    let previous = prediction.interpolate(now, {}).x;
+    for (let elapsed = 10; elapsed <= 1600; elapsed += 10) {
+      now = 1000 + elapsed;
+      simulation.x = simulation.previousX = 100 + 0.125 * elapsed;
+      const current = prediction.interpolate(now, {}).x;
+      expect(current).toBeGreaterThanOrEqual(previous - 0.001);
+      previous = current;
+    }
+    expect(previous).toBeCloseTo(simulation.x, 6);
+  } finally {
+    clock.mockRestore();
+  }
 });
 
 test("a dropped frame cannot teleport an animation clock", () => {

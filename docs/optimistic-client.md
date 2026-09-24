@@ -14,6 +14,8 @@ This first implementation resolves late combat against server state with its exi
 
 The later design sections remain a roadmap where they exceed this subset. [Measured validation](validation.md#optimistic-client-and-queued-actions) records the 122 focused tests and native 500 ms RTT queue/reconnect check. Inspection hashes at the end identify the original findings, not the implemented build.
 
+The initial implementation regressed local movement correction. The [follow-up walking check](validation.md#movement-correction-regression-at-high-latency) reproduces and repairs snapping and clock resets at 0/1,000/2,000 ms RTT with a 1.5-second traffic stall. The original queue check alone was insufficient evidence for local walking smoothness.
+
 ## Recommendation
 
 Make local input immediately visible, keep a bounded journal of unconfirmed intentions, and rebuild the predicted view from server state plus the remaining intentions whenever confirmation arrives. The server must independently validate every consequential action before it affects anyone's authoritative state. Corrections can be occasional; validation cannot be occasional.

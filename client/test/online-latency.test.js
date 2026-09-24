@@ -86,7 +86,7 @@ test("slow scene preparation keeps its socket, acknowledged baseline and command
     expect(t.lastEventSeq).toBe(1);
     expect(probe.sent.map((message) => message.type)).toEqual(["ack"]);
     expect(resolved).toBe(false);
-    ping(t, 2100);
+    ping(t, 4100);
     expect(t.status).toBe("synchronizing");
     expect(probe.closed).toEqual([]);
     // An already admitted command may finish during a baseline/art refresh.
@@ -145,7 +145,7 @@ test("clock outliers preserve the last usable estimate and the socket", () => {
   try {
     ping(t, 500);
     const before = t.clock.snapshot();
-    ping(t, 2100);
+    ping(t, 4100);
     expect(t.clock.snapshot()).toEqual(before);
     expect(closed).toEqual([]);
     ping(t, 520);
@@ -155,8 +155,34 @@ test("clock outliers preserve the last usable estimate and the socket", () => {
   }
 });
 
-test("500ms and 1000ms input schedules reach the server before their target tick", () => {
-  for (const roundTripMs of [0, 100, 500, 1000]) {
+test("small RTT noise cannot reset the field clock from a delayed packet burst", () => {
+  const clock = new ServerClock();
+  const base = {
+    connectionEpoch: "connection",
+    fieldEpoch: "field",
+    paused: false,
+  };
+  for (let tick = 100; tick <= 110; tick++) {
+    clock.observe({
+      ...base,
+      serverTick: tick,
+      receivedAt: 30000 + (tick - 100) * 30,
+      roundTripMs: tick === 100 ? 1000 : null,
+    });
+  }
+  const before = clock.tickOffsetMs;
+  clock.observe({
+    connectionEpoch: "connection",
+    serverTick: 160,
+    receivedAt: 31800,
+    roundTripMs: 1002,
+  });
+  clock.observe({ ...base, serverTick: 111, receivedAt: 31801 });
+  expect(Math.abs(clock.tickOffsetMs - before)).toBeLessThan(5);
+});
+
+test("input schedules up to two-second RTT with jitter reach the server before their target tick", () => {
+  for (const roundTripMs of [0, 100, 500, 1000, 2000, 2100]) {
     const clock = new ServerClock();
     clock.observe({
       connectionEpoch: "connection",
@@ -167,6 +193,7 @@ test("500ms and 1000ms input schedules reach the server before their target tick
       paused: false,
     });
     const targetTick = inputTargetTick(clock, 30000);
+    expect(clock.roundTripMs).toBe(roundTripMs);
     const actor = {
       state: "active",
       field: { epoch: "field", tick: clock.arrivalTick(30000) },
