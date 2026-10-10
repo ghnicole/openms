@@ -8,7 +8,9 @@ import { validateProfile } from "../profile/profile-validation.js";
 import { equipmentUpgrade } from "../items/equipment-enhancement.js";
 import { SAVED_LOCATION_TYPES } from "../profile/profile-domains.js";
 import { recalculateVitals } from "../character/character-stats.js";
+import { jobAdvancementGrowthRange } from "../character/offline-progression.js";
 import { skillPointPool } from "../skills/skill-allocation-rules.js";
+import { isCustomQuest } from "../quests/custom-quests.js";
 import {
   NPC_RUNTIME_LIMITS as LIMITS,
   npcInteger,
@@ -65,7 +67,6 @@ function originalName(value) {
 
 /** No missing table or fabricated renderer label is authority for an authored dependency. */
 export function validateNpcEnvironment(context, environment) {
-  npcInteger(environment.npcId, 1);
   requireNpc(
     environment.items &&
       environment.quests?.schemaVersion === 1 &&
@@ -74,12 +75,7 @@ export function validateNpcEnvironment(context, environment) {
     "NPC environment lacks original catalogs or ownership guards",
     "npc-dependency",
   );
-  requireNpc(
-    originalName(npcLookup(environment.names?.npc, environment.npcId)) &&
-      npcLookup(environment.portraits, environment.npcId),
-    "Interacting NPC name/portrait is not packaged",
-    "npc-dependency",
-  );
+  validateEnvironmentOwner(context, environment);
   if (context.requirements.has("atomic-field-travel")) {
     requireNpc(
       typeof environment.prepareTravel === "function",
@@ -98,6 +94,27 @@ export function validateNpcEnvironment(context, environment) {
   validateNameDependencies(context.dependencies, environment);
 }
 
+function validateEnvironmentOwner(context, environment) {
+  if (environment.portal === undefined) {
+    npcInteger(environment.npcId, 1);
+    requireNpc(
+      originalName(npcLookup(environment.names?.npc, environment.npcId)) &&
+        npcLookup(environment.portraits, environment.npcId),
+      "Interacting NPC name/portrait is not packaged",
+      "npc-dependency",
+    );
+    return;
+  }
+  // A portal script has no interacting NPC; one authored portal owns it.
+  requireNpc(
+    environment.npcId === undefined &&
+      /^[A-Za-z0-9_]{1,64}$/.test(environment.portal?.script) &&
+      context.source?.path === `scripts/portal/${environment.portal.script}.js`,
+    "Portal script environment differs from its authored source",
+    "npc-dependency",
+  );
+}
+
 function validateCatalogDependencies(dependencies, environment) {
   for (const id of dependencies.itemIds) {
     const template = npcLookup(environment.items, id);
@@ -108,6 +125,7 @@ function validateCatalogDependencies(dependencies, environment) {
     );
   }
   for (const id of dependencies.questIds) {
+    if (isCustomQuest(id)) continue; // State-only; no original record exists.
     requireNpc(
       npcLookup(environment.quests.records, id)?.id === id,
       `Original quest ${id} is unavailable`,
@@ -197,6 +215,11 @@ function compatibleQuestInfo(record) {
 /** Force transitions bypass Check/Act gates/rewards, but not unavailable progress state. */
 export function admitNpcForceQuests(context, environment) {
   if (!context.forceQuests) return;
+  // State-only custom quests have no original Check inventory to admit.
+  const original = [...context.forceQuestIds].filter(
+    (id) => !isCustomQuest(id),
+  );
+  if (!original.length) return;
   const rows = environment.quests.inventory?.Check?.rows;
   requireNpc(
     Array.isArray(rows) && rows.length <= MAX_QUEST_INVENTORY_ROWS,
@@ -204,7 +227,7 @@ export function admitNpcForceQuests(context, environment) {
     "npc-quest-definition",
   );
   const seen = new Set();
-  for (const id of context.forceQuestIds) {
+  for (const id of original) {
     compatibleQuestInfo(npcLookup(environment.quests.records, id));
   }
   for (const row of rows) {
@@ -226,7 +249,7 @@ export function admitNpcForceQuests(context, environment) {
       "npc-quest-definition",
     );
   }
-  for (const id of context.forceQuestIds) {
+  for (const id of original) {
     requireNpc(
       seen.has(id),
       "Force quest Check definition is missing",
@@ -456,6 +479,20 @@ function gameConstantRead(kind, value) {
   }
 }
 
+/** SERVER NPCConversationManager.java:320–323 and Character.getMaxClassLevel:5303–5305:
+ *  false below the class cap (Cygnus 120, otherwise 200). Only an eligible
+ *  character needs the Hall-of-Fame PlayerNPC registry, which stays unavailable. */
+function canSpawnPlayerNpc(turn, mapId) {
+  npcInteger(mapId, 0);
+  const cap = Math.trunc(turn.profile.job / 1000) === 1 ? 120 : 200;
+  requireNpc(
+    turn.profile.level < cap,
+    "Remote NPC service unavailable: hall-of-fame-player-npc",
+    "npc-remote-service",
+  );
+  return false;
+}
+
 function parseInteger(args) {
   const value = npcPrimitive(args[0]);
   const radix = args.length === 2 ? npcInteger(args[1]) : 0;
@@ -494,9 +531,25 @@ export function readNpcLocal(turn, kind, args) {
     case "saved-location-peek":
     case "saved-location-take":
       return readSavedLocation(turn, kind, args[0]);
+    case "event-manager":
+    case "event-property":
+      return readEventManager(turn, kind, args);
     default:
       return readNpcPure(turn, kind, args);
   }
+}
+
+/** Server-published EventManager properties; an absent manager is Cosmic's null. */
+function readEventManager(turn, kind, args) {
+  const events = turn.environment.events ?? {};
+  const known = typeof args[0] === "string" && Object.hasOwn(events, args[0]);
+  if (kind === "event-manager") return known ? args[0] : null;
+  requireNpc(
+    known && Object.hasOwn(events[args[0]], args[1]),
+    "Event manager property is unavailable",
+    "npc-dependency",
+  );
+  return events[args[0]][args[1]];
 }
 
 function readNpcPure(turn, kind, args) {
@@ -511,6 +564,8 @@ function readNpcPure(turn, kind, args) {
     case "first-job-stat-requirement":
     case "can-get-first-job":
       return firstJobRead(turn, kind, args);
+    case "can-spawn-player-npc":
+      return canSpawnPlayerNpc(turn, args[0]);
     case "can-hold-all":
       return canHoldAll(turn, args);
     default:
@@ -669,6 +724,21 @@ function itemEffect(turn, node, args) {
   turn.effects.push({ kind: "item", itemId: id, delta: count, show });
 }
 
+/** SERVER AbstractPlayerInteraction.removeAll:872–887 removes every carried
+ *  instance. Its extra equipped-instance removal is not admitted here. */
+function removeAllEffect(turn, id) {
+  itemTemplate(turn, id);
+  requireNpc(
+    inventoryType(id) !== 1,
+    "NPC removeAll of equipment requires equipped-item authority",
+    "npc-dependency",
+  );
+  const count = itemCount(turn.profile, id);
+  if (count === 0) return;
+  consumeTemplate(turn.profile, id, count);
+  turn.effects.push({ kind: "item", itemId: id, delta: -count, show: true });
+}
+
 function questEffect(turn, node, args) {
   const id = npcDependency(turn.context, "questIds", args[0]);
   const npcId =
@@ -695,7 +765,7 @@ function questEffect(turn, node, args) {
 
 function questKills(turn, id, state, previous) {
   const kills = state === 1 ? { ...(previous?.kills ?? {}) } : {};
-  if (state === 1) {
+  if (state === 1 && !isCustomQuest(id)) {
     const record = npcLookup(turn.environment.quests.records, id);
     for (const stage of record.stages) {
       for (const mob of stage.check.mobs) {
@@ -734,45 +804,67 @@ function authoredPortal(portal) {
   return portal;
 }
 
-/** Character.java:1141–1259; first explorer advancement only, server-reference/offline authority. */
-function jobEffect(turn, args) {
-  const profile = turn.profile,
-    job = npcInteger(args[0], 0, 32767);
+const FIRST_JOBS = new Set([100, 200, 300, 400, 500]);
+const SECOND_JOBS = new Set([
+  110, 120, 130, 210, 220, 230, 310, 320, 410, 420, 510, 520,
+]);
+
+/** Explorer first/second advancement only. Cosmic changeJob does not gate the
+ *  transition; its scripts do, so the authority refuses any other source job. */
+function requireJobTransition(profile, job) {
   requireNpc(
-    [100, 200, 300, 400, 500].includes(job),
+    FIRST_JOBS.has(job) || SECOND_JOBS.has(job),
     "This advancement requires unavailable advanced-job authority",
     "npc-dependency",
   );
+  if (FIRST_JOBS.has(job)) {
+    requireNpc(
+      profile.job === 0 && profile.level >= (job === 200 ? 8 : 10),
+      "First job advancement requires an eligible beginner",
+      "npc-job",
+    );
+    return;
+  }
   requireNpc(
-    profile.job === 0 && profile.level >= (job === 200 ? 8 : 10),
-    "First job advancement requires an eligible beginner",
+    profile.job === job - (job % 100) && profile.level >= 30,
+    "Second job advancement requires its level-30 first job",
     "npc-job",
   );
+}
+
+/** Character.java:1141–1259; explorer 1st/2nd advancement, server-reference/offline authority. */
+function jobEffect(turn, args) {
+  const profile = turn.profile,
+    job = npcInteger(args[0], 0, 32767);
+  requireJobTransition(profile, job);
   requireNpc(
     typeof args[1] === "boolean",
     "Invalid starting AP policy",
     "npc-value",
   );
   profile.job = job;
+  // changeJob:1154–1170: one SP into the new job's book (2nd job: OpenMS pool 1).
   profile.remainingSp[skillPointPool(job)] = npcInteger(
     profile.remainingSp[skillPointPool(job)] + 1,
     0,
   );
-  if (args[1]) profile.remainingAp = npcInteger(profile.remainingAp + 4, 0);
+  // changeJob:1172–1183: with USE_STARTING_AP_4 a 1st job gains 4 AP and an
+  // x10 2nd job 5; without it neither does.
+  if (args[1]) {
+    profile.remainingAp = npcInteger(
+      profile.remainingAp + (FIRST_JOBS.has(job) ? 4 : 5),
+      0,
+    );
+  }
   // Character.gainSlotsInternal:9157–9191 refuses an entire +4 above96; legacy saves are retained.
   for (let category = 0; category < 4; category++) {
     if (profile.inventorySlots[category] + 4 <= 96) {
       profile.inventorySlots[category] += 4;
     }
   }
-  const hp =
-    job === 200
-      ? 0
-      : randomInclusive(turn, job === 100 ? 200 : 100, job === 100 ? 250 : 150);
-  const mp =
-    job === 100
-      ? 0
-      : randomInclusive(turn, job === 200 ? 100 : 25, job === 200 ? 150 : 50);
+  const growth = jobAdvancementGrowthRange(job);
+  const hp = growth.hp[1] === 0 ? 0 : randomInclusive(turn, ...growth.hp);
+  const mp = growth.mp[1] === 0 ? 0 : randomInclusive(turn, ...growth.mp);
   profile.baseMaxHP = Math.min(30000, profile.baseMaxHP + hp);
   profile.baseMaxMP = Math.min(30000, profile.baseMaxMP + mp);
   recalculateVitals(profile, turn.environment.items);
@@ -826,10 +918,14 @@ function resetStatsEffect(turn, enabled) {
 export function applyNpcEffect(turn, node, args) {
   turn.environment.recordEffect?.(node, args);
   if (node.kind === "item") itemEffect(turn, node, args);
+  else if (node.kind === "remove-all") removeAllEffect(turn, args[0]);
   else if (node.kind === "job") jobEffect(turn, args);
   else if (node.kind === "reset-stats") resetStatsEffect(turn, args[0]);
   else if (node.kind === "warp") warpEffect(turn, args);
-  else if (node.kind === "save-location") saveLocation(turn, args[0]);
+  else if (node.kind === "portal-sound") {
+    // PortalPlayerInteraction.playPortalSound: presentation only, no profile change.
+    turn.effects.push({ kind: "portal-sound" });
+  } else if (node.kind === "save-location") saveLocation(turn, args[0]);
   else if (node.kind === "crafting-scroll") {
     requireNpc(
       args.length === 1 && typeof args[0] === "boolean",

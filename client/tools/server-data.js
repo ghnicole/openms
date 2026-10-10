@@ -9,6 +9,8 @@ import { hash, resource } from "./atlas.js";
 import { compileNpcScript } from "./npc-script-compiler.js";
 import { compileNpcRoutes } from "./npc-script-routes.js";
 import { compileTutorialPortal } from "./portal-data.js";
+import { compilePortalScript } from "./portal-script-compiler.js";
+import { compileTransportSchedule } from "./transport-schedule-compiler.js";
 import { TUTORIAL_PORTAL_PROGRAMS } from "../src/npc/npc-script-portals.js";
 import {
   sourcePaths as configuredSources,
@@ -22,6 +24,8 @@ const POLICY_KEYS = [
   "USE_AUTOASSIGN_STARTERS_AP",
   "USE_STARTING_AP_4",
   "USE_ENFORCE_JOB_SP_RANGE",
+  "USE_PARTY_FOR_STARTERS",
+  "USE_PARTY_EXP_BONUS",
 ];
 const MAX_POLICY_BYTES = 4096;
 const MAX_FILES = 10000;
@@ -185,21 +189,82 @@ async function scriptFile(root, source) {
   return file;
 }
 
-function collectTutorialPortal(source, file, portalPrograms) {
+function collectPortal(source, file, inventory, options) {
   const script = source.slice("scripts/portal/".length, -3);
   if (Object.hasOwn(TUTORIAL_PORTAL_PROGRAMS, script)) {
-    portalPrograms[script] = compileTutorialPortal({ script, text: file.text });
+    inventory.portalPrograms[script] = compileTutorialPortal({
+      script,
+      text: file.text,
+    });
+    return null;
+  }
+  const compilation = compilePortalScript({
+    text: file.text,
+    path: source,
+    sha256: file.sha256,
+    staticConfig: options.staticConfig,
+    originalQuestIds: options.originalQuestIds,
+  });
+  inventory.portalScripts[script] = compilation;
+  return compilationSummary(compilation);
+}
+
+/** One source's category compiler; other categories stay byte inventories. */
+function compileScript(state, category, path, { record, file }) {
+  const { options, staticConfig } = state;
+  if (category === "npc") {
+    const compilation = compileNpcScript({
+      text: file.text,
+      path: record.source,
+      sha256: file.sha256,
+      defaultTalk: scriptDefaultTalk(record.source, options.defaultTalkForNpc),
+      staticConfig,
+      originalQuestIds: options.originalQuestIds,
+      eventManagers: new Set(Object.keys(state.transportSchedules)),
+    });
+    state.compilations.push(compilation);
+    record.sourceText = file.text;
+    record.compilation = compilationSummary(compilation);
+  } else if (category === "portal") {
+    const summary = collectPortal(record.source, file, state, {
+      staticConfig,
+      originalQuestIds: options.originalQuestIds,
+    });
+    if (summary) record.compilation = summary;
+  } else if (category === "event") {
+    const compilation = compileTransportSchedule({
+      ...file,
+      path: record.source,
+    });
+    // Only the closed transport cycle runs; other events stay inventories.
+    if (compilation.status === "supported") {
+      state.transportSchedules[path.slice("event/".length, -3)] = {
+        ...compilation,
+        travelRate: state.travelRate,
+      };
+    }
+  } else if (category === "reactor") {
+    state.reactorPrograms[path.slice("reactor/".length, -3)] =
+      compileReactorReward({ ...file, source: record.source });
   }
 }
 
-async function scriptInventory(root, options, staticConfig) {
+async function scriptInventory(root, options, policy) {
   options.progress?.("Gameplay content: scanning local scripts");
+  // Sorted paths compile event/ before npc/: NPC sources admit only published transports.
   const paths = await sourcePaths(root, "", ".js");
   const files = [],
-    compilations = [],
     categories = Object.create(null);
-  const portalPrograms = Object.create(null);
-  const reactorPrograms = Object.create(null);
+  const state = {
+    options,
+    staticConfig: policy.staticConfig,
+    travelRate: policy.travelRate,
+    transportSchedules: Object.create(null),
+    compilations: [],
+    portalPrograms: Object.create(null),
+    portalScripts: Object.create(null),
+    reactorPrograms: Object.create(null),
+  };
   let bytes = 0;
   for (const path of paths) {
     const source = `scripts/${path}`;
@@ -215,38 +280,20 @@ async function scriptInventory(root, options, staticConfig) {
     const category = parts.length > 2 ? parts[1] : "root";
     categories[category] = (categories[category] ?? 0) + 1;
     const record = { source, bytes: file.bytes, sha256: file.sha256 };
-    if (category === "npc") {
-      const compilation = compileNpcScript({
-        text: file.text,
-        path: source,
-        sha256: file.sha256,
-        defaultTalk: scriptDefaultTalk(source, options.defaultTalkForNpc),
-        staticConfig,
-        originalQuestIds: options.originalQuestIds,
-      });
-      compilations.push(compilation);
-      record.sourceText = file.text;
-      record.compilation = compilationSummary(compilation);
-    }
-    if (category === "portal") {
-      collectTutorialPortal(source, file, portalPrograms);
-    }
-    if (category === "reactor") {
-      reactorPrograms[path.slice("reactor/".length, -3)] = compileReactorReward(
-        { ...file, source },
-      );
-    }
+    compileScript(state, category, path, { record, file });
     files.push(record);
   }
   options.progress?.(`Gameplay content: ${files.length} scripts inventoried`);
   return {
     status:
-      "npc-complete-source-compiler; verified-tutorial-portals; other-categories-inventoried",
+      "npc-complete-source-compiler; verified-tutorial-portals; portal-scripts-through-npc-compiler; other-categories-inventoried",
     categories,
     files,
-    compilations,
-    portalPrograms,
-    reactorPrograms,
+    compilations: state.compilations,
+    portalPrograms: state.portalPrograms,
+    portalScripts: state.portalScripts,
+    reactorPrograms: state.reactorPrograms,
+    transportSchedules: state.transportSchedules,
   };
 }
 
@@ -342,7 +389,42 @@ function inventorySummary(inventory, tables, scripts) {
     npcScriptsBlocked: scripts.compilations.filter(
       (script) => script.status === "blocked",
     ).length,
+    portalScriptsSupported: Object.values(scripts.portalScripts).filter(
+      (script) => script.status === "supported",
+    ).length,
+    portalScriptsBlocked: Object.values(scripts.portalScripts).filter(
+      (script) => script.status === "blocked",
+    ).length,
   };
+}
+
+/** Supported portal programs join the packaged dependency closure NPC routes use. */
+function publishPortalScripts(shops, portalScripts) {
+  const supported = Object.create(null);
+  const sets = Object.fromEntries(
+    Object.entries(shops.supportedDependencies).map(([key, values]) => [
+      key,
+      new Set(values),
+    ]),
+  );
+  for (const [script, compilation] of Object.entries(portalScripts)) {
+    if (compilation.status !== "supported") continue;
+    supported[script] = compilation;
+    for (const [key, values] of Object.entries(compilation.dependencies)) {
+      if (!sets[key]) throw new Error(`Unknown portal dependency: ${key}`);
+      for (const value of values) sets[key].add(value);
+    }
+  }
+  shops.portalScripts = supported;
+  shops.supportedDependencies = Object.fromEntries(
+    Object.entries(sets).map(([key, values]) => [
+      key,
+      [...values].sort((a, b) =>
+        typeof a === "number" ? a - b : a.localeCompare(b),
+      ),
+    ]),
+  );
+  shops.supportedItemIds = shops.supportedDependencies.itemIds;
 }
 
 /** Local gameplay settings only; no server implementation, Java hashes or deployment config. */
@@ -353,7 +435,7 @@ export async function npcRuntimePolicy(root) {
     !value ||
     value.schemaVersion !== 1 ||
     value.enhancedCrafting !== false ||
-    Object.keys(value).length !== 3 ||
+    Object.keys(value).length !== 4 ||
     !value.staticConfig ||
     Array.isArray(value.staticConfig)
   ) {
@@ -369,12 +451,21 @@ export async function npcRuntimePolicy(root) {
       "Gameplay policy must contain exactly the supported boolean settings",
     );
   }
+  // Cosmic WorldConfig.travel_rate: transport rides/departures take 1/N of the authored time.
+  if (
+    !Number.isSafeInteger(value.travelRate) ||
+    value.travelRate < 1 ||
+    value.travelRate > 60
+  ) {
+    throw new Error("Gameplay policy travelRate must be an integer in 1..60");
+  }
   return {
     sources: [
       { source: "scripts/policy.json", sha256: file.sha256, bytes: file.bytes },
     ],
     enhancedCrafting: value.enhancedCrafting,
     equipmentRandomStats: false,
+    travelRate: value.travelRate,
     staticConfig: value.staticConfig,
   };
 }
@@ -388,7 +479,7 @@ export async function convertServerData(options = {}) {
   const inventory = await readSqlInventory(sqlRoot, options.progress);
   options.progress?.("Gameplay content: collecting SQL tables");
   const tables = collectTables(inventory);
-  const scripts = await scriptInventory(root, options, policy.staticConfig);
+  const scripts = await scriptInventory(root, options, policy);
   const datasets = Object.create(null);
   for (const [name, names] of Object.entries(DOMAINS)) {
     options.progress?.(`Gameplay content: converting ${name} tables`);
@@ -403,6 +494,8 @@ export async function convertServerData(options = {}) {
     datasets.shops,
     compileNpcRoutes(datasets.shops.tables, scripts.compilations),
   );
+  publishPortalScripts(datasets.shops, scripts.portalScripts);
+  datasets.shops.transportSchedules = scripts.transportSchedules;
   datasets.shops.sources.push(...policy.sources);
   datasets.shops.npcCraftingPolicy = {
     enhancedCrafting: policy.enhancedCrafting,
@@ -424,12 +517,17 @@ export async function convertServerData(options = {}) {
     exclusions: [
       "Account, character, inventory, keymap and storage bootstrap rows are not browser reference data; no credentials are published.",
       "Schema-only tables contain no world content. SQL defaults are not seed rows.",
-      "NPC compilation admits bounded closed syntax; unknown constructs block a route. Recognized unavailable services stop the selected step before durable effects commit. Four hash-verified tutorial portal programs are admitted; other script categories remain inventories.",
+      "NPC compilation admits bounded closed syntax; unknown constructs block a route. Recognized unavailable services stop the selected step before durable effects commit. Four hash-verified tutorial portal programs are admitted; other sentinel portal scripts compile through the NPC compiler (enter(pi) as start) and run only on the online authority; other script categories remain inventories.",
       "SQL prices/drop chances are Cosmic server policy, not original Nexon client authority.",
     ],
     summary,
   };
-  return { report, datasets };
+  // Runtime switches read from the catalog by the server and browser rules.
+  const runtimePolicy = {
+    USE_PARTY_FOR_STARTERS: policy.staticConfig.USE_PARTY_FOR_STARTERS,
+    USE_PARTY_EXP_BONUS: policy.staticConfig.USE_PARTY_EXP_BONUS,
+  };
+  return { report, datasets, policy: runtimePolicy };
 }
 
 /** Uses the same immutable resource publisher and descriptor contract as extraction. */
@@ -458,6 +556,7 @@ export async function extractServerData(options) {
   return {
     schemaVersion: 2,
     authority: AUTHORITY,
+    policy: converted.policy,
     datasets,
     report,
     summary: converted.report.summary,

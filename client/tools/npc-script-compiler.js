@@ -2,6 +2,7 @@ import {
   npcBooleanConfig,
   npcMissingQuestService,
   npcRemoteService,
+  npcRemoteReceiver,
   npcRemoteLoop,
 } from "./npc-script-services.js";
 import {
@@ -43,6 +44,7 @@ const EFFECTS = Object.freeze({
   resetStats: { kind: "reset-stats", min: 0, max: 0 },
   warp: { kind: "warp", min: 1, max: 2, dependency: "mapIds" },
   gainItem: { kind: "item", min: 1, max: 3, dependency: "itemIds" },
+  removeAll: { kind: "remove-all", min: 1, max: 1, dependency: "itemIds" },
   forceStartQuest: {
     kind: "quest-start",
     min: 1,
@@ -286,8 +288,18 @@ function itemEffect(context, node, refs) {
   };
 }
 
+// GenericPortal authority publishes only one warp and its sound.
+const PORTAL_EFFECT_KINDS = new Set(["warp", "portal-sound"]);
+
+function admitPortalEffect(context, node, kind) {
+  if (context.portal && !PORTAL_EFFECT_KINDS.has(kind)) {
+    blockScript(context, node, `Unsupported portal effect: ${kind}`);
+  }
+}
+
 function effectStatement(context, scope, node, spec) {
   const args = node.arguments;
+  admitPortalEffect(context, node, spec.kind);
   if (args.length < spec.min || args.length > spec.max) {
     blockScript(context, node, "Unsupported local effect overload");
   }
@@ -459,7 +471,9 @@ function defaultDialog(context, scope, node) {
 
 function callStatement(context, scope, node) {
   const remote =
-    npcMissingQuestService(context, node) ?? npcRemoteService(node);
+    npcMissingQuestService(context, node) ??
+    npcRemoteService(node, context.portal) ??
+    npcRemoteReceiver(context, scope, node);
   if (remote) return { op: "unavailable", service: remote };
   const saved =
     savedLocationCall(context, scope, node) ??
@@ -479,6 +493,14 @@ function callStatement(context, scope, node) {
 
 function localCallStatement(context, scope, node) {
   const method = cmMethod(node);
+  // PortalPlayerInteraction.playPortalSound; NPCConversationManager has no such member.
+  if (context.portal && method === "playPortalSound") {
+    return effectStatement(context, scope, node, {
+      kind: "portal-sound",
+      min: 0,
+      max: 0,
+    });
+  }
   if (Object.hasOwn(NPC_DIALOG_METHODS, method)) {
     return dialogStatement(context, scope, node, NPC_DIALOG_METHODS[method]);
   }
@@ -607,9 +629,14 @@ function controlStatement(context, work, node, scope) {
     };
   }
   if (node.type === "IfStatement") {
+    const test = compileExpression(context, scope, node.test);
+    // An unavailable test traps on arrival, so neither branch is reachable.
+    if (context.expressions[test]?.op === "unavailable") {
+      return { op: "unavailable", service: context.expressions[test].service };
+    }
     return {
       op: "if",
-      test: compileExpression(context, scope, node.test),
+      test,
       yes: childStatement(context, work, node.consequent),
       no: childStatement(context, work, node.alternate),
     };
@@ -736,11 +763,17 @@ export function compileNpcScript(input) {
   context.defaultTalk = input.defaultTalk;
   context.staticConfig = input.staticConfig;
   context.originalQuestIds = input.originalQuestIds;
+  context.eventManagers = input.eventManagers;
+  context.portal = input.portal === true;
   let program = null;
   try {
+    const parsed = parseNpcSource(text);
     const root = lowerNpcHelpers(
       context,
-      lowerNpcRecords(context, parseNpcSource(text)),
+      lowerNpcRecords(
+        context,
+        context.portal ? input.lowerSource(parsed) : parsed,
+      ),
     );
     inspectScopes(context, root);
     context.root = root;

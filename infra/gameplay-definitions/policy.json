@@ -1,11 +1,14 @@
 {
   "schemaVersion": 1,
   "enhancedCrafting": false,
+  "travelRate": 1,
   "staticConfig": {
     "USE_CPQ": true,
     "USE_ENABLE_SOLO_EXPEDITIONS": false,
     "USE_AUTOASSIGN_STARTERS_AP": true,
     "USE_STARTING_AP_4": false,
-    "USE_ENFORCE_JOB_SP_RANGE": false
+    "USE_ENFORCE_JOB_SP_RANGE": false,
+    "USE_PARTY_FOR_STARTERS": false,
+    "USE_PARTY_EXP_BONUS": true
   }
 }

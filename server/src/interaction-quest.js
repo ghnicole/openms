@@ -10,15 +10,20 @@ import {
   transaction,
 } from "../../client/src/quests/quest-rules.js";
 import { questObjectives } from "../../client/src/quests/quest-journal-model.js";
+import { isCustomQuest } from "../../client/src/quests/custom-quests.js";
 import { learnedGrowth } from "../../client/src/character/offline-progression.js";
 import {
   currentNpc,
   requireInteraction,
   serverRandomSamples,
+  sampleReader,
   INTERACTION_LIMITS,
 } from "./interaction-common.js";
 import { operationFor, admitActor } from "./action-rules.js";
-import { finishQuestDialogue } from "./interaction-quest-dialogue.js";
+import {
+  finishQuestDialogue,
+  silentQuestAction,
+} from "./interaction-quest-dialogue.js";
 import { narrativeQuestSystem } from "./interaction-quest-system.js";
 import { virtualNpcLease } from "./interaction-npc-lease.js";
 import {
@@ -118,6 +123,12 @@ export async function executeQuest(actor, message, world) {
   if (action.kind === "quest.abandon") {
     return abandonQuest(actor, message, world);
   }
+  return commitQuestAction(actor, message, world, null);
+}
+
+/** Accept/claim against the admitted conversation; `silent` overrides its operation. */
+async function commitQuestAction(actor, message, world, silent) {
+  const action = message.action;
   const lease = admitQuestConversation(actor, action, world);
   const kind = action.kind === "quest.accept" ? "accept" : "claim";
   const record = onlineQuestCatalog(world.content).records[action.questId];
@@ -126,6 +137,7 @@ export async function executeQuest(actor, message, world) {
     lease,
     record,
     stage,
+    ...silent,
   });
   if (receipt.status === "committed") {
     lease.step++;
@@ -180,7 +192,8 @@ export function progressQuestViews(actor, world) {
   const views = [];
   const system = { catalog: onlineQuestCatalog(world.content) };
   for (const [key, progress] of entries) {
-    if (progress.state === 0) continue;
+    // State-only custom quests have no journal record.
+    if (progress.state === 0 || isCustomQuest(key)) continue;
     const id = Number(key);
     const record = onlineQuestCatalog(world.content).records[id];
     requireInteraction(record, "CONTENT_MISMATCH");
@@ -209,7 +222,7 @@ export function progressQuestViews(actor, world) {
 }
 
 /** Native Title supplies an authored endpoint, not an invented physical placement. */
-function openMedal(actor, message, world) {
+async function openMedal(actor, message, world) {
   requireCharacterRevision(actor, message);
   admitActor(actor, world, message.fieldEpoch);
   requireInteraction(actor.profile.hp > 0, "CHARACTER_BUSY");
@@ -227,17 +240,53 @@ function openMedal(actor, message, world) {
   closeConversation(actor, world);
   actor.conversation = lease;
   startQuestDialogue(actor, world, lease, questId);
-  return interactionReceipt(actor.revision);
+  return (
+    (await commitSilentQuest(actor, message, world, {
+      operation: operationFor(message),
+    })) ?? interactionReceipt(actor.revision)
+  );
+}
+
+/**
+ * A selected zero-page stage commits inside the selecting operation, as the
+ * original client sends its action without dialogue (see silentQuestAction).
+ * Returns null when the stage has dialogue; a refusal closes the conversation.
+ */
+export async function commitSilentQuest(actor, message, world, silent) {
+  const lease = actor.conversation;
+  const kind = silentQuestAction(lease);
+  if (!kind) return null;
+  const action = {
+    kind,
+    questId: lease.questDialogue.record.id,
+    conversationId: lease.id,
+    step: lease.step,
+  };
+  try {
+    return await commitQuestAction(
+      actor,
+      { ...message, action },
+      world,
+      silent,
+    );
+  } finally {
+    if (
+      actor.conversation === lease &&
+      lease.questDialogue.mode === "confirm"
+    ) {
+      closeConversation(actor, world);
+    }
+  }
 }
 
 /** EXP, quest rewards and every mirrored family level effect share one durable cohort. */
 function commitQuest(actor, message, world, plan) {
   const now = Date.now();
-  const sample = serverRandomSamples()[0];
+  const samples = serverRandomSamples();
   const ids = [...new Set([actor.id, ...familyProgressIds(actor.profile)])];
   return world.participants.commit(
     actor,
-    operationFor(message),
+    plan.operation ?? operationFor(message),
     ids,
     async (drafts) => {
       const draft = drafts.get(actor.id);
@@ -254,7 +303,8 @@ function commitQuest(actor, message, world, plan) {
         selected: message.action.rewardChoice,
         growth,
         items: world.content.items,
-        random: () => sample,
+        // First sample keeps the weighted-reward draw; level-up rolls read the following ones.
+        random: sampleReader(samples),
         now,
       });
       requireInteraction(
@@ -283,6 +333,7 @@ function commitQuest(actor, message, world, plan) {
         operationId: message.operationId,
       });
       return {
+        domainRevision: plan.domainRevision,
         value: { kind: "quest.changed", questId: record.id, state: stage + 1 },
         events: questRewardEvents(record, stage, result),
       };

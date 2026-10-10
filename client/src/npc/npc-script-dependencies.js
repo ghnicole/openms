@@ -209,11 +209,19 @@ function effectDependencies(analysis, node) {
     validateSavedType(analysis.context, node);
     return;
   }
-  if (["meso", "crafting-scroll", "job", "reset-stats"].includes(node.kind)) {
+  if (
+    ["meso", "crafting-scroll", "job", "reset-stats", "portal-sound"].includes(
+      node.kind,
+    )
+  ) {
     return;
   }
   if (node.kind === "warp") {
     ids(analysis, "mapIds", node.args[0]);
+    return;
+  }
+  if (node.kind === "remove-all") {
+    ids(analysis, "itemIds", node.args[0]);
     return;
   }
   const family = node.kind === "item" ? "itemIds" : "questIds";

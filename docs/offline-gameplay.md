@@ -80,11 +80,49 @@ the thief skill-book identity; existing executable-backed skill allocation
 consumers remain authoritative for learning. They do **not** establish Nexon's
 advancement eligibility or reward formulas. The Windows runtime remains unavailable.
 Hall-of-Fame PlayerNPC and party-quest progress calls are explicit unavailable
-services. Source quests absent from the original Quest Check inventory, including
-Dark Lord's server-custom100009/100011, are explicit lazy `custom-quest-progress`
-traps: a reached call fails the whole turn, rather than fabricating quest records
-or blocking an unrelated beginner branch. Advanced-job mutations are refused
-without changing the draft's published state.
+services. `cm.canSpawnPlayerNpc` is a local read that is false below the
+reference class cap (`Character.getMaxClassLevel`: Cygnus 120, otherwise 200),
+so instructors reach their job dialogue; at the cap it still traps as
+`hall-of-fame-player-npc`. The 2nd-job server-custom quests 100000–100011
+(instructor letters, test entry and proof; `client/src/quests/custom-quests.js`)
+are state-only: they live in `profile.quests` like Cosmic's queststatus rows,
+with no record, mob counters, rewards or journal entry, so existing saves need
+no migration. Other source quests absent from the original Quest Check
+inventory (for example the 3rd-job 100200 family) remain explicit lazy
+`custom-quest-progress` traps: a reached call fails the whole turn, rather than
+fabricating quest records or blocking an unrelated beginner branch.
+Explorer 2nd-job changes (110/120/130, 210/220/230, 310/320, 410/420, 510/520)
+use the same transaction from exactly their level-30 first job: one SP into
+the new job's pool (`skillPointPool`, pool 1), 5 AP only with
+`USE_STARTING_AP_4`, +4 slots for the four item categories, and the reference
+`changeJob` HP300–350 (warriors), MP450–500 (magicians) or HP300–350/MP150–200
+(others). 3rd/4th-job and any other transition is refused without changing the
+draft's published state.
+
+The explorer job-test maps 108000100/200/300/400 are already in the strict
+route closure with their inside instructors 1072006/1072005/1072004/1072007,
+their test mobs (9000001/2, 9000100/1, 9000200/1, 9000300/1) and those mobs'
+supported Dark Marble 4031013 rows (`152-drop-data.sql`, 70%, no quest gate);
+`server/test/second-job-content.test.js` checks the packaged catalog. The
+compiled NPC programs change, so a catalog extracted before these commits still
+carries the old traps/blockers until extraction is re-run. The pirate test rooms
+108000501/108000502 are not packaged: Kyrin's warp there sits behind his
+`field-population` and `event-instance` traps.
+`server/test/second-job-advancement.test.js` walks a level-30 warrior through
+Dances with Balrog → 1072000 → test map → 1072004 → Dances with Balrog on the
+real `executeNpc` worker/replay path (scripts compiled from the vendored
+sources, Dark Marbles granted directly) and ends as Fighter 110.
+
+Kyrin's `scripts/npc/1090000.js` uses the same first-job transaction for job0→500
+(DEX20, gun1492000, knuckle1482000, bullets2330000×1000). Its other branches
+need server state OpenMS does not own, so they compile to the same lazy traps:
+`event-instance` (`getEventInstance`, `getEventManager` and calls on its result),
+`quest-info-progress` (`getQuestProgressInt`, `setQuestProgress`), `skill-grant`
+(`teachSkill`), `field-population` (`getPlayerCount`) and `random-outcome`
+(`Math.random()` comparisons). A comparison against one of these values traps
+before its other operand is lowered, and an `if` whose test traps compiles to
+that trap without lowering either branch. Focused regression source is
+`client/test/npc-pirate-advancement.test.js`.
 
 Focused regression source is `client/test/npc-thief-advancement.test.js`, with
 the retained complete authored script and source hash in its JSON fixture.

@@ -1,3 +1,4 @@
+import { isCustomQuest } from "../src/quests/custom-quests.js";
 import {
   call,
   cmMethod,
@@ -19,6 +20,55 @@ const PARTY_QUEST_CALLS = new Set([
   "removePartyQuestItem",
   "setPartyQuestItemObtained",
 ]);
+// Server state without local authority: event instances, numbered quest info
+// progress, direct skill grants and other characters' field population.
+const UNAVAILABLE_CALLS = Object.freeze({
+  getEventInstance: "event-instance",
+  getEventManager: "event-instance",
+  getQuestProgressInt: "quest-info-progress",
+  setQuestProgress: "quest-info-progress",
+  teachSkill: "skill-grant",
+  getPlayerCount: "field-population",
+});
+// PortalPlayerInteraction members without local authority. Portal sources only;
+// an NPC `cm` receiver keeps its own closed method set.
+const PORTAL_UNAVAILABLE_CALLS = Object.freeze({
+  message: "player-message",
+  playerMessage: "player-message",
+  mapMessage: "player-message",
+  blockPortal: "portal-session-state",
+  getPortal: "portal-session-state",
+  openNpc: "npc-conversation",
+  showInstruction: "client-presentation",
+  showInfo: "client-presentation",
+  showInfoText: "client-presentation",
+  showWZEffect: "client-presentation",
+  changeMusic: "client-presentation",
+  talkGuide: "client-presentation",
+  removeGuide: "client-presentation",
+  setDirectionStatus: "client-presentation",
+  unlockUI: "client-presentation",
+  earnTitle: "client-presentation",
+  enableActions: "client-presentation",
+  isEventLeader: "event-instance",
+  startDungeonInstance: "event-instance",
+  containsAreaInfo: "quest-info-progress",
+  getWarpMap: "field-state",
+  resetMapObjects: "field-state",
+  gainItem: "inventory-mutation",
+  removeAll: "inventory-mutation",
+  useItem: "inventory-mutation",
+  cancelItem: "inventory-mutation",
+  forceStartQuest: "quest-mutation",
+  forceCompleteQuest: "quest-mutation",
+});
+const PORTAL_PLAYER_UNAVAILABLE_CALLS = Object.freeze({
+  message: "player-message",
+  dropMessage: "player-message",
+  getEventInstance: "event-instance",
+});
+const REMOTE_RECEIVER_CALLS = Object.freeze(["size", "get", "startInstance"]);
+const MAX_RECEIVER_CHAIN = 16;
 const GAME_CONSTANT_READS = Object.freeze({
   getHallOfFameMapid: "hall-of-fame-map",
   getSkillBook: "skill-book",
@@ -37,20 +87,63 @@ const QUEST_CALLS = new Set([
   "completeQuest",
 ]);
 
-/** A server custom quest without original Check/Info authority remains an explicit lazy trap. */
+/** A server custom quest without original Check/Info authority remains an explicit lazy trap,
+ *  except the closed state-only set in custom-quests.js. */
 export function npcMissingQuestService(context, node) {
   const id = node?.arguments?.[0]?.value;
   return QUEST_CALLS.has(cmMethod(node)) &&
     Number.isSafeInteger(id) &&
     context.originalQuestIds &&
-    !context.originalQuestIds.has(id)
+    !context.originalQuestIds.has(id) &&
+    !isCustomQuest(id)
     ? "custom-quest-progress"
     : null;
 }
-/** Known remote operations compile to a transactional trap, never a host invocation. */
-export function npcRemoteService(node) {
+/** Portal-only receivers: `pi`, `pi.getPlayer()` and any `pi.getMap()` method
+ *  other than the map-id read lower to a trap. */
+function portalRemoteService(node) {
   const method = cmMethod(node);
-  if (method === "canSpawnPlayerNpc") return "hall-of-fame-player-npc";
+  if (Object.hasOwn(PORTAL_UNAVAILABLE_CALLS, method)) {
+    return PORTAL_UNAVAILABLE_CALLS[method];
+  }
+  const player = playerMethod(node);
+  if (Object.hasOwn(PORTAL_PLAYER_UNAVAILABLE_CALLS, player)) {
+    return PORTAL_PLAYER_UNAVAILABLE_CALLS[player];
+  }
+  const receiver = node?.callee?.object;
+  if (
+    node?.type === "CallExpression" &&
+    !call(node, "getId") &&
+    (cmMethod(receiver) === "getMap" || playerMethod(receiver) === "getMap") &&
+    receiver.arguments.length === 0
+  ) {
+    return "field-state";
+  }
+  return null;
+}
+
+/** Known remote operations compile to a transactional trap, never a host invocation.
+ *  In a portal source a receiver evaluates before its member call, so a trapping
+ *  receiver anywhere in a bounded call chain makes the whole chain unreachable. */
+export function npcRemoteService(node, portal = false) {
+  if (!portal) return remoteCall(node);
+  for (
+    let depth = 0;
+    node?.type === "CallExpression" && depth < MAX_RECEIVER_CHAIN;
+    depth++
+  ) {
+    const service = portalRemoteService(node) ?? remoteCall(node);
+    if (service) return service;
+    node = node.callee.type === "MemberExpression" ? node.callee.object : null;
+  }
+  return null;
+}
+
+function remoteCall(node) {
+  const method = cmMethod(node);
+  if (Object.hasOwn(UNAVAILABLE_CALLS, method)) {
+    return UNAVAILABLE_CALLS[method];
+  }
   if (PARTY_QUEST_CALLS.has(playerMethod(node))) return "party-quest-progress";
   if (PARTY_CALLS.has(method) || playerMethod(node) === "getParty") {
     return "party-membership";
@@ -155,14 +248,53 @@ export function npcBooleanConfig(context, name) {
   return value;
 }
 
+/** `cm.getEventManager("<published transport>")`; any other name keeps its trap. */
+export function admittedEventManager(context, node) {
+  const name = node?.arguments?.[0];
+  return cmMethod(node) === "getEventManager" &&
+    node.arguments.length === 1 &&
+    name.type === "Literal" &&
+    typeof name.value === "string" &&
+    context.eventManagers?.has(name.value)
+    ? name.value
+    : null;
+}
+
+/** EventManager reads: the manager (null when unpublished) and its getProperty. */
+function eventRead(context, scope, node) {
+  if (admittedEventManager(context, node)) {
+    return { op: "read", kind: "event-manager", args: [] };
+  }
+  const receiver = node.callee?.object;
+  if (
+    call(node, "getProperty") &&
+    node.arguments.length === 1 &&
+    receiver.type === "Identifier" &&
+    context.variables.some((variable) => variable.name === receiver.name) &&
+    resolveVariable(context, scope, receiver)?.eventManager
+  ) {
+    return {
+      op: "read",
+      kind: "event-property",
+      args: [],
+      operands: [receiver, node.arguments[0]],
+    };
+  }
+  return null;
+}
+
 export function npcServiceExpression(context, scope, node) {
   if (node.type === "MemberExpression" && !node.computed) {
     return configField(context, scope, node);
   }
+  const event = eventRead(context, scope, node);
+  if (event) return event;
   const host = staticHostExpression(context, scope, node);
   if (host) return host;
   const service =
-    npcMissingQuestService(context, node) ?? npcRemoteService(node);
+    npcMissingQuestService(context, node) ??
+    npcRemoteService(node, context.portal) ??
+    comparisonService(node, context.portal);
   if (service) return { op: "unavailable", service };
   const collection = remoteCollectionExpression(context, scope, node);
   if (collection) return collection;
@@ -173,17 +305,42 @@ export function npcServiceExpression(context, scope, node) {
   return mapServiceExpression(node);
 }
 
+/** Comparing an unavailable value traps before its other operand is lowered. */
+function comparisonService(node, portal) {
+  if (node.type !== "BinaryExpression") return null;
+  if (
+    call(node.left, "random") &&
+    node.left.arguments.length === 0 &&
+    node.left.callee.object.type === "Identifier" &&
+    node.left.callee.object.name === "Math"
+  ) {
+    // Server-side random selection has no authored local authority.
+    return "random-outcome";
+  }
+  return npcRemoteService(node.left, portal);
+}
+
 function remoteCollectionExpression(context, scope, node) {
   if (
-    (call(node, "size") || call(node, "get")) &&
+    (context.portal
+      ? node.type === "CallExpression" &&
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed
+      : REMOTE_RECEIVER_CALLS.some((name) => call(node, name))) &&
     node.callee.object.type === "Identifier"
   ) {
-    const binding = resolveVariable(context, scope, node.callee.object);
-    if (binding?.remoteService) {
-      return { op: "unavailable", service: binding.remoteService };
-    }
+    const service = remoteBinding(context, scope, node.callee.object);
+    if (service) return { op: "unavailable", service };
   }
   return null;
+}
+
+/** Only an authored binding is resolved; host names keep their own diagnostics. */
+function remoteBinding(context, scope, node) {
+  if (!context.variables.some((variable) => variable.name === node.name)) {
+    return null;
+  }
+  return resolveVariable(context, scope, node)?.remoteService ?? null;
 }
 
 function mapServiceExpression(node) {
@@ -203,6 +360,19 @@ function mapServiceExpression(node) {
     return { op: "read", kind: "cpq-loser-map", args: [] };
   }
   return null;
+}
+
+/** A statement call on a remote-service binding is unreachable past its trapping initializer. */
+export function npcRemoteReceiver(context, scope, node) {
+  const receiver = node.callee?.object;
+  if (
+    !context.portal ||
+    node.callee?.type !== "MemberExpression" ||
+    receiver.type !== "Identifier"
+  ) {
+    return null;
+  }
+  return remoteBinding(context, scope, receiver);
 }
 
 /** A server-owned collection cannot be materialized locally; fail before iterating it. */

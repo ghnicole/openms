@@ -1,3 +1,4 @@
+import { canFormParty, partyForStarters } from "../profile/profile-social.js";
 import { FAMILY_ENTITLEMENTS, familyDay } from "./local-social-family.js";
 import { memberIds } from "./local-social-context.js";
 
@@ -173,7 +174,9 @@ function permissions(service, social) {
   const state = {
     active: !service.busy,
     id: service.store.id,
+    job: service.store.profile.job,
     level: service.store.profile.level,
+    partyForStarters: partyForStarters(service.catalog),
     allowPartySearch:
       service.store.profile.settings.gameOptions.allowPartySearch,
     guildRank:
@@ -204,11 +207,13 @@ function permissions(service, social) {
   return result;
 }
 
-function partyPermissions(result, social, { active, id, level }) {
+function partyPermissions(result, social, state) {
+  const { active, id } = state;
   for (const action of ["party.expel", "party.leader"]) {
     result[action] = active && social.party?.leaderId === id;
   }
-  result["party.create"] = active && !social.party && level >= 10;
+  result["party.create"] =
+    active && !social.party && canFormParty(state, state.partyForStarters);
   result["party.leave"] = active && Boolean(social.party);
 }
 
@@ -270,15 +275,12 @@ function messengerPermissions(result, social, active) {
   }
 }
 
-function searchPermissions(
-  result,
-  social,
-  { active, id, level, allowPartySearch },
-) {
+function searchPermissions(result, social, state) {
+  const { active, id, allowPartySearch } = state;
   const eligible =
     active &&
     allowPartySearch &&
-    level >= 10 &&
+    canFormParty(state, state.partyForStarters) &&
     (!social.party || social.party.leaderId === id);
   result["search.register"] = eligible && !social.search;
   result["search.update"] = eligible && Boolean(social.search);
