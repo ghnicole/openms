@@ -44,6 +44,7 @@ import {
   markAutomaticPortalAttempt,
   travelParticipants,
   prepareLogout,
+  bindActorField,
 } from "./field-transition.js";
 import { developActor, prepareMonsterSpawns } from "./field-development.js";
 import {
@@ -78,11 +79,7 @@ import {
   settleFieldReactors,
   destroyFieldReactors,
 } from "./field-reactors.js";
-import {
-  prepareMotionDiverts,
-  releaseMotionDiverts,
-  takeMotionDiverts,
-} from "./field-diverts.js";
+import { releaseMotionDiverts, takeMotionDiverts } from "./field-diverts.js";
 import { serverOwnsPosition, combatMotionOwner } from "./motion-authority.js";
 import {
   enqueueMovement,
@@ -355,13 +352,12 @@ export class OnlineWorld {
   prepareEntry(actor, field) {
     actor.arrival = nearestSavedArrival(field.manifest, actor.profile.location);
     actor.simulation = createSimulation(field.physics, actor.arrival);
-    actor.field = field;
+    bindActorField(actor, field);
     actor.input = createHeldInput();
     actor.inputQueue = new Map();
     resetAttackInput(actor);
     actor.inputSeq = 0;
     actor.ackInputSeq = null;
-    actor.lastInputTick = field.tick;
     actor.state = "preparing";
     actor.pending = false;
     actor.pendingOperation = null;
@@ -370,11 +366,8 @@ export class OnlineWorld {
     actor.developmentReceipts = new Map();
     actor.playSession ??= randomUUID();
     actor.portalUntil = 0;
-    actor.actionStartTick = field.tick;
     actor.lastCheckpoint = this.now;
     actor.admission = "OK";
-    actor.lastAdoptedTick = field.tick;
-    prepareMotionDiverts(actor, field);
   }
 
   /** Resume reports are diagnostics only. Reconnection never grants client position. */
@@ -538,7 +531,9 @@ export class OnlineWorld {
       throw protocolError("SERVER_BUSY");
     }
     field.tick++;
-    for (const actor of field.characters.values()) this.moveActor(actor);
+    for (const actor of field.characters.values()) {
+      this.moveActorIsolated(actor);
+    }
     advanceCombat(this, field);
     advanceDrops(this, field);
     advanceReactors(this, field, PROTOCOL.TICK_MS);
@@ -594,6 +589,32 @@ export class OnlineWorld {
     actor.profile.location.x = actor.simulation.x;
     actor.profile.location.y = actor.simulation.y;
     actor.profile.location.facing = actor.simulation.facing;
+  }
+
+  /**
+   * One client's protocol fault (for example more queued attack edges than the bound) ends
+   * that client's connection, never the shared simulation. Errors without a protocol code
+   * are server faults and still propagate to the lifecycle, which suspends the world.
+   */
+  moveActorIsolated(actor) {
+    try {
+      this.moveActor(actor);
+    } catch (error) {
+      if (typeof error?.code !== "string") throw error;
+      this.rejectActor(actor, error.code);
+    }
+  }
+
+  /** Close one connection for its own protocol fault; the character may reconnect. */
+  rejectActor(actor, code) {
+    this.neutralize(actor);
+    this.log?.("actor.rejected", {
+      character: actor.id,
+      map: actor.field?.mapId,
+      code,
+    });
+    this.publish(actor, { type: "closing", code, retryAfterMs: 0 });
+    actor.connection?.close(1008, code);
   }
 
   /** Exhausted movement time is a recoverable connection failure, not cheat evidence. */
@@ -661,7 +682,9 @@ export class OnlineWorld {
         this.neutralize(actor);
         this.log?.("checkpoint.failed", {
           character: actor.id,
-          code: error.code ?? "SERVER_BUSY",
+          code: error.code ?? null,
+          message: error.message,
+          cause: error.cause?.errno ?? error.cause?.code ?? null,
         });
         this.publish(actor, {
           type: "closing",
