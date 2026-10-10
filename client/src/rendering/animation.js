@@ -323,6 +323,83 @@ export class EntityAnimation {
     this.setExpression("blink", duration);
   }
 
+  /** Automatic blink scheduler for character entities that have a `blink` face
+   *  expression. Mirrors GM MapleCharacter.pas L1290-L1332 and sdlms run_face_animate:
+   *  4-mode random decision (0 = skip, 1..3 = consecutive blinks) every 5-8 s.
+   *  This runs ALWAYS (mirroring GM source which does NOT gate blink scheduling on
+   *  body pose). Non-default face expressions (player-triggered smile/wink/etc.)
+   *  suppress the blink scheduler so they play out completely. */
+  advanceBlink(ms) {
+    if (this.kind !== "character" || !this.expressions.has("blink")) return;
+
+    // Climbing: GM source skips FaceFrame selection entirely while on ladder/rope.
+    // Suppress auto-blink, and cancel any in-progress blink so the face snaps back.
+    if (BLINK_SUPPRESS_ACTIONS.has(this.action)) {
+      if (this.expression === "blink") {
+        this.setExpression("default", 0);
+        this.blinkState.blinking = false;
+      }
+      return;
+    }
+
+    // A blink is currently playing — let it finish. advanceExpression handles
+    // the duration countdown; we just mark blinking for the post-blink branch.
+    if (this.expression === "blink") {
+      this.blinkState.blinking = true;
+      return;
+    }
+
+    // Player-triggered non-default expression (smile, wink, oops, ...) takes
+    // full control — pause the idle blink scheduler but keep existing counters.
+    if (this.expression !== "default") return;
+
+    // Just returned from a blink to default — decide whether consecutive.
+    if (this.blinkState.blinking) {
+      this.blinkState.blinking = false;
+      if (this.blinkState.remainingBlinks > 1) {
+        this.blinkState.remainingBlinks -= 1;
+        this._triggerBlink();
+        return;
+      }
+      // Final blink in the round — reset counters, schedule next decision.
+      this.blinkState.remainingBlinks = 0;
+      this.blinkState.nextDecisionMs =
+        BLINK_IDLE_MIN_MS + Math.random() * BLINK_IDLE_RANGE_MS;
+      return;
+    }
+
+    // Regular scheduler countdown. Always runs regardless of body action.
+    if (this.blinkState.nextDecisionMs > 0) {
+      this.blinkState.nextDecisionMs -= ms;
+      if (this.blinkState.nextDecisionMs > 0) return;
+      this.blinkState.nextDecisionMs = 0;
+    }
+
+    // 4-way uniform roll: 0 = skip, 1 = single, 2 = double, 3 = triple.
+    const mode = Math.floor(Math.random() * BLINK_MODES);
+    if (mode === 0) {
+      this.blinkState.nextDecisionMs =
+        BLINK_IDLE_MIN_MS + Math.random() * BLINK_IDLE_RANGE_MS;
+      return;
+    }
+    this.blinkState.remainingBlinks = mode;
+    this._triggerBlink();
+  }
+
+  _triggerBlink() {
+    // expressionLoops holds the authored per-expression cycle (480 ms for blink
+    // from extracted data), while expressionDuration is a generic 5-second
+    // max-lifetime shared by ALL face expressions — not the blink animation
+    // duration. GM source uses a multi-frame FaceFrame/FaceTime mechanism; we
+    // collapse it into one expressionLoopMs cycle here.
+    const loopMs = this.expressionLoops.get("blink");
+    const duration = Number.isFinite(loopMs) && loopMs > 0
+      ? loopMs
+      : this.expressionDurations.get("blink");
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    this.setExpression("blink", duration);
+  }
+
   /** Seek an authoritative action clock without exposing mutable frame bookkeeping.
    * Resuming a completed one-shot at an earlier time clears completion.
    * @param {number} ms Elapsed milliseconds since the current action began. */
