@@ -1,6 +1,12 @@
 import { test, expect } from "bun:test";
 import { createPlayerInput } from "../src/input/player-input.js";
 import { AranInput } from "../src/skills/aran-input.js";
+import {
+  createDefaultBindings,
+  heldActionForCode,
+  isAssignableKey,
+  keyIndexForCode,
+} from "../src/input/keymap.js";
 
 function key(target, type, code, repeat = false) {
   const event = new Event(type, { cancelable: true });
@@ -62,6 +68,32 @@ test("both modifier sides share the native action without releasing each other's
     expect(input.state.jumpPressed).toBe(true);
     input.afterTick();
     expect(input.state.jumpPressed).toBe(false);
+  });
+});
+
+function command(target, code, metaKey = true) {
+  const event = new Event("keydown", { cancelable: true });
+  Object.assign(event, { code, repeat: false, metaKey });
+  target.dispatchEvent(event);
+  return event;
+}
+
+test("Command/Windows is its own unbound key until Key Config assigns it", () => {
+  expect(keyIndexForCode("MetaLeft")).toBe(85);
+  expect(keyIndexForCode("MetaRight")).toBe(85);
+  expect(isAssignableKey(85)).toBe(true);
+  const defaults = createDefaultBindings();
+  expect(defaults.keys[85]).toEqual({ type: 0, id: 0 });
+  expect(heldActionForCode("MetaLeft", defaults)).toBe(null);
+  defaults.keys[85] = { ...defaults.keys[29] }; // Key Config: drag Attack onto Command
+  expect(heldActionForCode("MetaLeft", defaults)).toBe("attack");
+});
+
+test("an unbound Command press and Command shortcuts stay with the browser", () => {
+  withInput((input, canvas) => {
+    expect(command(canvas, "MetaLeft").defaultPrevented).toBe(false);
+    expect(input.state.attack).toBe(false);
+    expect(command(canvas, "KeyR").defaultPrevented).toBe(false);
   });
 });
 
